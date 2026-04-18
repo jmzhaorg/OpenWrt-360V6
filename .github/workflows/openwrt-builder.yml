@@ -1,0 +1,289 @@
+name: Build OpenWrt for 360 V6
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/openwrt-builder.yml'
+      - '.config'
+      - 'files/**'
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: master
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    # Docker + sing-box 体积大，编译时间长，480 分钟更稳妥
+    timeout-minutes: 480
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📦 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🗑️ Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/share/swift /usr/local/.ghcup /usr/lib/jvm
+          sudo docker rmi $(docker images -q) 2>/dev/null || true
+          sudo apt-get autoremove -y --purge && sudo apt-get clean
+          sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
+          echo "=== 释放后磁盘空间 ==="
+          df -h
+
+      - name: 🛠️ Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git \
+            libncurses5-dev libssl-dev python3 python3-pip \
+            rsync swig unzip zlib1g-dev wget curl ca-certificates file
+
+      - name: 📥 Clone Source
+        run: |
+          git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+          cd openwrt
+          echo "OPENWRT_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date '+%Y-%m-%d %H:%M')" >> $GITHUB_ENV
+
+      - name: 📦 Install Custom Packages
+        run: |
+          cd openwrt
+
+          # ── Argon 主题 ────────────────────────────────────────────────
+          rm -rf package/luci-theme-argon
+          git clone --depth 1 https://github.com/jerrykuku/luci-theme-argon.git \
+            package/luci-theme-argon
+          echo "✅ luci-theme-argon 克隆完成"
+
+          # ── HomeProxy ─────────────────────────────────────────────────
+          rm -rf package/homeproxy
+          git clone --depth 1 https://github.com/immortalwrt/homeproxy.git \
+            package/homeproxy
+          echo "✅ homeproxy 克隆完成"
+
+          # ── Lucky（sirpdboy 版本含完整 OpenWrt Makefile）─────────────
+          # 优先检查 feeds 是否已包含，避免重复
+          if find feeds -name "luci-app-lucky" -maxdepth 6 -type d 2>/dev/null | grep -q .; then
+            echo "✅ luci-app-lucky 已在 feeds 中，跳过克隆"
+          else
+            rm -rf package/luci-app-lucky
+            git clone --depth 1 https://github.com/sirpdboy/luci-app-lucky.git \
+              package/luci-app-lucky \
+              && echo "✅ luci-app-lucky 克隆完成" \
+              || echo "⚠️  luci-app-lucky 克隆失败，defconfig 会自动跳过"
+          fi
+
+      - name: 🔄 Update & Install Feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 🔍 查看 360v6 设备定义
+        run: |
+          echo "=== ipq60xx.mk 全部设备定义 ==="
+          grep "define Device\|TARGET_DEVICES" openwrt/target/linux/qualcommax/image/ipq60xx.mk
+          echo "=== 所有 DTS 文件 ==="
+          find openwrt/target/linux/qualcommax/files -name "*.dts" | sort
+
+      - name: ⚙️ Apply Config
+        run: |
+          cd openwrt
+
+          # ── 1. 移除 sing-box-tiny 冲突 ──────────────────────────────
+          SINGBOX_MK="feeds/packages/net/sing-box/Makefile"
+          if [ -f "$SINGBOX_MK" ]; then
+            sed -i '/define Package\/sing-box-tiny/,/^endef/d' "$SINGBOX_MK"
+            sed -i '/BuildPackage,sing-box-tiny/d' "$SINGBOX_MK"
+            echo "✅ 已移除 sing-box-tiny"
+          fi
+
+          # ── 2. 检查可选包是否存在（仅提示，不中断编译）──────────────
+          for PKG in luci-app-fileassistant luci-app-crontabs luci-app-cpufreq \
+                     luci-app-lucky luci-app-dockerman luci-app-nss-pbuf; do
+            if find feeds package -name "$PKG" -maxdepth 6 -type d 2>/dev/null | grep -q .; then
+              echo "✅ $PKG 存在"
+            else
+              echo "⚠️  $PKG 未找到，将由 defconfig 自动跳过（不影响编译）"
+            fi
+          done
+
+          # ── 3. 清空 TARGET_DEVICES，只保留 qihoo_360v6 ──────────────
+          MK="target/linux/qualcommax/image/ipq60xx.mk"
+          sed -i '/^TARGET_DEVICES +=/d' "$MK"
+          echo 'TARGET_DEVICES += qihoo_360v6' >> "$MK"
+          echo "=== 修改后 TARGET_DEVICES ==="
+          grep "TARGET_DEVICES" "$MK"
+
+          # ── 4. 复制并清理配置 ────────────────────────────────────────
+          cp "${GITHUB_WORKSPACE}/.config" .config
+
+          # 去掉旧的设备锁定 / PARTSIZE / luci-app-opkg 禁用行，防止冲突
+          sed -i '/CONFIG_TARGET_.*DEVICE.*/d' .config
+          sed -i '/CONFIG_TARGET_ROOTFS_PARTSIZE/d' .config
+          sed -i '/# CONFIG_PACKAGE_luci-app-opkg is not set/d' .config
+          # 去掉旧版 docker 禁用（已在 .config 中用注释处理，此处兜底）
+          sed -i '/^# CONFIG_PACKAGE_docker is not set/d' .config
+
+          # 写入设备锁定（首行）
+          sed -i '1s/^/CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qihoo_360v6=y\n/' .config
+
+          # ── 5. 展开配置 ──────────────────────────────────────────────
+          make defconfig 2>&1 | tail -5
+
+          # ── 6. 校验设备锁定 ──────────────────────────────────────────
+          if grep -q "^CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qihoo_360v6=y" .config; then
+            echo "✅ 设备锁定：qihoo_360v6"
+          else
+            echo "❌ 设备锁定失败，实际选中："
+            grep "CONFIG_TARGET_.*DEVICE.*=y" .config
+            exit 1
+          fi
+
+          # ── 7. 复制预置配置文件 ──────────────────────────────────────
+          mkdir -p files/etc/uci-defaults
+          mkdir -p files/etc/sysctl.d
+          cp "${GITHUB_WORKSPACE}/files/etc/uci-defaults/99-custom-ip" \
+             files/etc/uci-defaults/99-custom-ip
+          cp "${GITHUB_WORKSPACE}/files/etc/sysctl.d/99-bbr.conf" \
+             files/etc/sysctl.d/99-bbr.conf
+          chmod +x files/etc/uci-defaults/99-custom-ip
+          echo "✅ 预置配置文件已复制"
+          echo "=== 校验 uci-defaults 脚本 ==="
+          cat files/etc/uci-defaults/99-custom-ip
+
+          # ── 8. 打印关键配置确认 ──────────────────────────────────────
+          echo "=== 关键包配置确认 ==="
+          grep -E \
+            "luci-app-fileassistant|luci-lua-runtime|luci-app-wol|\
+            luci-app-autoreboot|luci-app-adguardhome|adguardhome|\
+            luci-app-ddns|luci-app-upnp|luci-app-nlbwmon|\
+            luci-app-diskman|kmod-tcp-bbr|kmod-fs-ntfs3|\
+            luci-app-samba4|smartmontools|luci-app-smartdns|\
+            luci-app-ipv6helper|luci-app-crontabs|automount|\
+            luci-app-cpufreq|dockerd|luci-app-dockerman|\
+            luci-app-lucky|kmod-sfe|kmod-fast-classifier|\
+            kmod-qca-nss|luci-app-nss-pbuf|luci-app-opkg|\
+            ca-bundle|libustream-openssl|PARTSIZE|homeproxy|sing-box" \
+            .config || true
+          echo "=== files/ 目录预置文件 ==="
+          find files -type f | sort
+
+      - name: ⬇️ Download Packages
+        run: |
+          cd openwrt
+          make download -j$(nproc)
+          # 删除下载不完整的文件（小于 1KB）
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: 🔨 Compile Firmware
+        id: compile
+        run: |
+          cd openwrt
+          echo "🔨 开始编译 ($(nproc) 线程)..."
+          if make -j$(nproc) 2>&1 | tee build.log; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ 多线程失败，降级单线程（输出详细日志）..."
+            if make -j1 V=s 2>&1 | tee -a build.log; then
+              echo "status=success" >> $GITHUB_OUTPUT
+            else
+              echo "status=failure" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          fi
+
+      - name: 📦 Prepare Artifacts
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          TARGET_DIR="openwrt/bin/targets/qualcommax/ipq60xx"
+          if [ ! -d "$TARGET_DIR" ]; then
+            echo "❌ 目标目录不存在，当前 bin 结构："
+            find openwrt/bin/targets -type d -maxdepth 3
+            exit 1
+          fi
+          cd "$TARGET_DIR"
+          echo "📂 输出文件列表："
+          ls -lh
+          mkdir -p output
+          cp *360v6* output/ 2>/dev/null || true
+          cp sha256sums output/ 2>/dev/null || true
+          if ! ls output/*360v6* >/dev/null 2>&1; then
+            echo "❌ 未找到 360 V6 固件，请检查编译日志"
+            exit 1
+          fi
+          echo "✅ 固件验证通过"
+          ls -lh output/
+          echo "FIRMWARE_PATH=$PWD/output" >> $GITHUB_ENV
+
+      - name: 🚀 Upload to Release
+        if: steps.compile.outputs.status == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: stable-v${{ github.run_number }}
+          name: OpenWrt 360 V6 (${{ env.BUILD_DATE }})
+          body: |
+            ## 📦 OpenWrt for 360 V6 (Qualcomm IPQ60xx)
+            - **版本**: ImmortalWrt master (SNAPSHOT)
+            - **构建时间**: ${{ env.BUILD_DATE }}
+            - **源码 Commit**: ${{ env.OPENWRT_COMMIT }}
+
+            ### ✨ 已内置功能
+            - ✅ 中文界面 + Argon 主题
+            - ✅ HomeProxy + sing-box 代理
+            - ✅ ttyd 网页终端
+            - ✅ ath11k 无线驱动（AX1800）
+            - ✅ USB 存储自动挂载 + ext4/NTFS3 + DiskMan
+            - ✅ USB 硬盘健康检测 smartmontools
+            - ✅ Samba4 文件共享（局域网 NAS）
+            - ✅ 文件管理器 fileassistant
+            - ✅ 网络唤醒 WOL
+            - ✅ 定时重启 + 计划任务界面
+            - ✅ AdGuard Home 广告过滤
+            - ✅ SmartDNS 国内 DNS 加速
+            - ✅ DDNS 动态域名（含 Cloudflare 脚本）
+            - ✅ UPnP 自动端口映射
+            - ✅ 流量监控 nlbwmon
+            - ✅ IPv6 支持（含 ipv6helper 一键配置）
+            - ✅ BBR 拥塞控制 + SFE 软件硬件加速
+            - ✅ 网络诊断工具 mtr / tcpdump
+            - ✅ CPU 频率调节
+            - ✅ Docker + dockerman 容器管理
+            - ✅ Lucky 内网穿透 / 反向代理
+            - ✅ 软件源管理（opkg / LuCI 软件源界面）
+
+            ### 📌 默认信息
+            - 管理地址：**http://192.168.2.1**
+            - 用户名：root，密码：无（首次登录请立即设置密码）
+            - SSH：`opkg update` 即可安装额外软件包
+            - IPv6：需在 LuCI → 网络 → IPv6 Helper 中开启
+            - Samba：需在 LuCI → 服务 → 网络共享 中配置共享路径
+            - NSS 加速：若出现稳定性问题可 SSH 执行 `opkg remove kmod-qca-nss-drv`
+
+          files: ${{ env.FIRMWARE_PATH }}/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📋 Show Build Log Tail
+        if: always()
+        run: |
+          echo "=== build.log 大小 ==="
+          ls -lh openwrt/build.log 2>/dev/null || echo "build.log 不存在"
+          echo "=== 编译日志最后 150 行 ==="
+          tail -150 openwrt/build.log 2>/dev/null || echo "(无日志)"
+          echo "=== bin 目录完整内容 ==="
+          find openwrt/bin -type f | sort
+          echo "=== .config 中的设备确认 ==="
+          grep "DEVICE\|TARGET_BOARD\|TARGET_SUBTARGET" openwrt/.config | grep -v "^#"
+          echo "=== files/ 目录预置内容 ==="
+          find openwrt/files -type f 2>/dev/null || echo "(files/ 目录不存在)"
