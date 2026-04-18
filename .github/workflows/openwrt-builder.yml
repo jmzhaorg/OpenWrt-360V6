@@ -155,10 +155,18 @@ jobs:
              files/etc/uci-defaults/99-custom-ip
           cp "${GITHUB_WORKSPACE}/files/etc/sysctl.d/99-bbr.conf" \
              files/etc/sysctl.d/99-bbr.conf
+          cp "${GITHUB_WORKSPACE}/files/etc/uci-defaults/98-fix-apk-feeds" \
+             files/etc/uci-defaults/98-fix-apk-feeds
+          cp "${GITHUB_WORKSPACE}/files/etc/uci-defaults/97-install-docker" \
+             files/etc/uci-defaults/97-install-docker
           chmod +x files/etc/uci-defaults/99-custom-ip
+          chmod +x files/etc/uci-defaults/98-fix-apk-feeds
+          chmod +x files/etc/uci-defaults/97-install-docker
           echo "✅ 预置配置文件已复制"
           echo "=== 校验 uci-defaults 脚本 ==="
           cat files/etc/uci-defaults/99-custom-ip
+          cat files/etc/uci-defaults/98-fix-apk-feeds
+          cat files/etc/uci-defaults/97-install-docker
 
           # ── 8. 打印关键配置确认 ──────────────────────────────────────
           echo "=== 关键包配置确认 ==="
@@ -263,10 +271,10 @@ jobs:
             ### 📌 默认信息
             - 管理地址：**http://192.168.2.1**
             - 用户名：root，密码：无（首次登录请立即设置密码）
-            - SSH：`opkg update` 即可安装额外软件包
+            - SSH：`apk update && apk upgrade` 即可更新软件包
             - IPv6：需在 LuCI → 网络 → IPv6 Helper 中开启
             - Samba：需在 LuCI → 服务 → 网络共享 中配置共享路径
-            - NSS 加速：若出现稳定性问题可 SSH 执行 `opkg remove kmod-qca-nss-drv`
+            - NSS 加速：若出现稳定性问题可 SSH 执行 `apk del kmod-qca-nss-drv`
 
           files: ${{ env.FIRMWARE_PATH }}/*
           draft: false
