@@ -200,26 +200,32 @@ jobs:
         id: compile
         run: |
           cd openwrt
-          echo "🔨 开始编译 ($(nproc) 线程)..."
+          set -o pipefail
+          echo "🔨 开始多线程编译 ($(nproc) 线程)..."
           if make -j$(nproc) 2>&1 | tee build.log; then
             echo "status=success" >> $GITHUB_OUTPUT
+            echo "✅ 多线程编译成功"
           else
-            echo "⚠️ 多线程失败，降级单线程（输出详细日志）..."
-            if make -j1 V=s 2>&1 | tee -a build.log; then
+            echo "⚠️ 多线程失败，降级单线程输出完整日志..."
+            make -j1 V=s > build-verbose.log 2>&1
+            MAKE_EXIT=$?
+            cat build-verbose.log >> build.log
+            if [ $MAKE_EXIT -eq 0 ]; then
               echo "status=success" >> $GITHUB_OUTPUT
+              echo "✅ 单线程编译成功"
             else
               echo "status=failure" >> $GITHUB_OUTPUT
-              echo ""
-              echo "=============================="
-              echo "❌ 编译失败，关键错误信息如下："
-              echo "=============================="
-              grep -i "error:\|Error \|undefined reference\|No rule to make\|fatal:" build.log                 | grep -v "^#" | tail -40
-              echo ""
-              echo "=== 最后 80 行完整日志 ==="
-              tail -80 build.log
+              echo "========================================"
+              echo "❌ 编译失败，关键错误："
+              echo "========================================"
+              grep -iE "error:|fatal error:|undefined reference|No rule to make|cannot find|Error [0-9]" \
+                build-verbose.log | grep -v "^#" | grep -v "Werror" | tail -60
+              echo "=== build-verbose.log 最后 100 行 ==="
+              tail -100 build-verbose.log
               exit 1
             fi
           fi
+
 
       - name: 📦 Prepare Artifacts
         if: steps.compile.outputs.status == 'success'
@@ -297,10 +303,12 @@ jobs:
       - name: 📋 Show Build Log Tail
         if: always()
         run: |
-          echo "=== build.log 大小 ==="
-          ls -lh openwrt/build.log 2>/dev/null || echo "build.log 不存在"
-          echo "=== 编译日志最后 150 行 ==="
-          tail -150 openwrt/build.log 2>/dev/null || echo "(无日志)"
+          echo "=== 日志文件大小 ==="
+          ls -lh openwrt/build.log openwrt/build-verbose.log 2>/dev/null || true
+          echo "=== build.log 最后 50 行 ==="
+          tail -50 openwrt/build.log 2>/dev/null || echo "(无日志)"
+          echo "=== build-verbose.log 最后 150 行（含详细错误）==="
+          tail -150 openwrt/build-verbose.log 2>/dev/null || echo "(无详细日志，说明多线程已成功)"
           echo "=== bin 目录完整内容 ==="
           find openwrt/bin -type f | sort
           echo "=== .config 中的设备确认 ==="
