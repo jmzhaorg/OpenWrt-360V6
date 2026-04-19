@@ -159,14 +159,18 @@ jobs:
              files/etc/uci-defaults/98-fix-apk-feeds
           cp "${GITHUB_WORKSPACE}/files/etc/uci-defaults/97-install-docker" \
              files/etc/uci-defaults/97-install-docker
+          cp "${GITHUB_WORKSPACE}/files/etc/uci-defaults/96-install-extras" \
+             files/etc/uci-defaults/96-install-extras
           chmod +x files/etc/uci-defaults/99-custom-ip
           chmod +x files/etc/uci-defaults/98-fix-apk-feeds
           chmod +x files/etc/uci-defaults/97-install-docker
+          chmod +x files/etc/uci-defaults/96-install-extras
           echo "✅ 预置配置文件已复制"
           echo "=== 校验 uci-defaults 脚本 ==="
           cat files/etc/uci-defaults/99-custom-ip
           cat files/etc/uci-defaults/98-fix-apk-feeds
           cat files/etc/uci-defaults/97-install-docker
+          cat files/etc/uci-defaults/96-install-extras
 
           # ── 8. 打印关键配置确认 ──────────────────────────────────────
           echo "=== 关键包配置确认 ==="
@@ -205,6 +209,14 @@ jobs:
               echo "status=success" >> $GITHUB_OUTPUT
             else
               echo "status=failure" >> $GITHUB_OUTPUT
+              echo ""
+              echo "=============================="
+              echo "❌ 编译失败，关键错误信息如下："
+              echo "=============================="
+              grep -i "error:\|Error \|undefined reference\|No rule to make\|fatal:" build.log                 | grep -v "^#" | tail -40
+              echo ""
+              echo "=== 最后 80 行完整日志 ==="
+              tail -80 build.log
               exit 1
             fi
           fi
