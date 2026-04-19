@@ -1,56 +1,44 @@
 #!/bin/sh
 # 97-install-docker
-# 首次启动时安装 dockerd 并设置开机自启
-# 依赖 98-fix-apk-feeds 先执行（数字小的先跑，97 < 98，
-# 但 uci-defaults 按文件名字母顺序执行，97 < 98 确保顺序正确）
+# 等待 96-install-extras 安装好 dockerd 后，启用并启动 docker 服务
+# 96 先跑（数字小先执行），dockerd 二进制由 96 负责安装
 
-LOG_TAG="install-docker"
+LOG_TAG="start-docker"
 
-# 检查 dockerd 是否已安装
-if command -v dockerd >/dev/null 2>&1; then
-    echo "✅ dockerd 已安装，跳过"
-    # 确保服务已启用
-    service dockerd enable 2>/dev/null
-    service dockerd start  2>/dev/null
+log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; echo "$1"; }
+
+# ── 等待 dockerd 二进制就位（最多等 120 秒）────────────────────
+log "⏳ 等待 dockerd 安装完成..."
+for i in $(seq 1 60); do
+    if command -v dockerd >/dev/null 2>&1; then
+        log "✅ dockerd 已就位（${i}x2 秒）"
+        break
+    fi
+    sleep 2
+done
+
+if ! command -v dockerd >/dev/null 2>&1; then
+    log "❌ dockerd 未找到，跳过启动（请检查 apk add dockerd 是否成功）"
     exit 0
 fi
 
-echo "⏳ dockerd 未安装，开始安装..." | logger -t "$LOG_TAG"
-
-# 等待 apk update 完成（98-fix-apk-feeds 应已执行）
-sleep 3
-
-# 安装 docker 相关包
-apk add --no-cache \
-    dockerd \
-    docker \
-    docker-compose \
-    luci-app-dockerman \
-    luci-i18n-dockerman-zh-cn \
-    kmod-nf-conntrack \
-    kmod-nf-conntrack6 \
-    kmod-br-netfilter \
-    kmod-veth \
-    cgroupfs-mount \
-    2>&1 | logger -t "$LOG_TAG"
-
-# 挂载 cgroup（Docker 必须）
+# ── 挂载 cgroup2（Docker 必须）──────────────────────────────────
 if ! mount | grep -q cgroup2; then
-    mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+    mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null \
+        && log "✅ cgroup2 挂载成功" \
+        || log "⚠️  cgroup2 挂载失败（可能已由内核自动挂载）"
 fi
 
-# 启用并启动 dockerd
+# ── 启用并启动 dockerd ───────────────────────────────────────────
 service dockerd enable 2>&1 | logger -t "$LOG_TAG"
 service dockerd start  2>&1 | logger -t "$LOG_TAG"
 
-# 等待启动
+# ── 等待服务就绪 ─────────────────────────────────────────────────
 sleep 5
-
-# 验证
 if service dockerd status 2>/dev/null | grep -q running; then
-    echo "✅ dockerd 启动成功" | logger -t "$LOG_TAG"
+    log "✅ dockerd 启动成功"
 else
-    echo "⚠️  dockerd 启动失败，请手动执行: service dockerd start" | logger -t "$LOG_TAG"
+    log "⚠️  dockerd 未运行，请 SSH 执行: service dockerd start"
 fi
 
 exit 0
