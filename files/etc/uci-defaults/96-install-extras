@@ -1,44 +1,70 @@
 #!/bin/sh
 # 96-install-extras
-# 首次启动后台安装大体积包，不阻塞启动流程
-LOG_TAG="install-extras"
 DONE_FLAG="/etc/install-extras-done"
-
 [ -f "$DONE_FLAG" ] && exit 0
 
 nohup sh -c '
 LOG_TAG="install-extras"
 DONE_FLAG="/etc/install-extras-done"
-[ -f "$DONE_FLAG" ] && exit 0
-
 log() { echo "[$(date +%H:%M:%S)] $1" | logger -t "$LOG_TAG"; }
 
-log "⏳ 等待系统启动完成..."
+log "⏳ 等待系统启动完成 (30s)..."
 sleep 30
 
 # 修复 video feed
-REPO_DIR="/etc/apk/repositories.d"
-for f in "$REPO_DIR"/*.list; do
+for f in /etc/apk/repositories.d/*.list; do
     [ -f "$f" ] && sed -i "/\/video\//d" "$f"
 done
 
-# 等待 WAN 网络就绪（最多等 3 分钟）
+# 等待 WAN 网络（最多 3 分钟）
 log "⏳ 等待 WAN 网络..."
 for i in $(seq 1 90); do
     ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && break
     sleep 2
 done
 
-# 更新索引
 apk update 2>&1 | logger -t "$LOG_TAG"
 true
 
-# 安装各包（逐个安装，失败不影响其他包）
-for pkg in "dockerd docker docker-compose cgroupfs-mount" "samba4-server" "adguardhome" "lucky luci-app-lucky luci-i18n-lucky-zh-cn" "luci-app-fileassistant"; do
+# 安装 dockerd
+log "📦 安装 dockerd..."
+apk add --no-cache dockerd docker docker-compose cgroupfs-mount \
+    2>&1 | logger -t "$LOG_TAG" \
+    && log "✅ dockerd 安装完成" \
+    || log "⚠️  dockerd 安装失败"
+
+# 配置 Docker daemon.json
+# heredoc 不能用在单引号 sh -c 内，改用 printf
+mkdir -p /etc/docker
+
+# 安装完 dockerd 后再检测 USB（automount 可能需要时间）
+USB_MOUNT=""
+for mp in /mnt/sda1 /mnt/sda /mnt/usb /mnt/mmcblk0p1; do
+    if mountpoint -q "$mp" 2>/dev/null; then
+        USB_MOUNT="$mp"
+        log "✅ 检测到 USB 挂载点: $USB_MOUNT"
+        break
+    fi
+done
+
+if [ -n "$USB_MOUNT" ] && command -v dockerd >/dev/null 2>&1; then
+    DOCKER_DIR="$USB_MOUNT/docker-data"
+    mkdir -p "$DOCKER_DIR"
+    printf "{\n  \"data-root\": \"%s\",\n  \"log-driver\": \"json-file\",\n  \"log-opts\": {\"max-size\": \"10m\", \"max-file\": \"3\"}\n}\n" \
+        "$DOCKER_DIR" > /etc/docker/daemon.json
+    log "✅ Docker 数据目录已设置为 $DOCKER_DIR（USB）"
+else
+    printf "{\n  \"log-driver\": \"json-file\",\n  \"log-opts\": {\"max-size\": \"5m\", \"max-file\": \"2\"}\n}\n" \
+        > /etc/docker/daemon.json
+    log "⚠️  未检测到 USB，Docker 数据存在 overlay，建议插入 USB 后重新配置"
+fi
+
+# 安装其他包
+for pkg in "samba4-server" "adguardhome" "lucky luci-app-lucky luci-i18n-lucky-zh-cn" "luci-app-fileassistant"; do
     log "📦 安装: $pkg"
     apk add --no-cache $pkg 2>&1 | logger -t "$LOG_TAG" \
-        && log "✅ $pkg 安装完成" \
-        || log "⚠️  $pkg 安装失败"
+        && log "✅ $pkg 完成" \
+        || log "⚠️  $pkg 失败"
 done
 
 # 刷新 LuCI
@@ -46,7 +72,7 @@ rm -f /tmp/luci-indexcache* 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null || true
 
 touch "$DONE_FLAG"
-log "🎉 install-extras 完成"
+log "🎉 install-extras 全部完成"
 ' >> /tmp/install-extras.log 2>&1 &
 
 exit 0
