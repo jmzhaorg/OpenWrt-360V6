@@ -1,12 +1,12 @@
 #!/bin/sh
-# 99-custom-ip
-# 设置 LAN IP 为 192.168.2.1
-# heredoc 的 EOF 必须顶格，不能有空格
+# 99-custom-ip - 设置 LAN IP 为 192.168.2.1
+# 用逐条 uci set 替代 batch heredoc，避免任何解析问题
 
-uci -q batch <<-EOF
-	set network.lan.ipaddr='192.168.2.1'
-	set network.lan.netmask='255.255.255.0'
-	commit network
-EOF
+uci set network.lan.ipaddr='192.168.2.1'
+uci set network.lan.netmask='255.255.255.0'
+uci commit network
+
+# 重启网络让配置生效（uci-defaults 执行完后系统会重启，此行可选）
+# /etc/init.d/network restart
 
 exit 0
