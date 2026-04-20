@@ -2,12 +2,10 @@
 # 98-fix-apk-feeds
 # 修复 video feed，立即执行不等待网络
 # 96 里已经处理过了，这里做兜底确保
-
 REPO_LIST_DIR="/etc/apk/repositories.d"
 for f in "$REPO_LIST_DIR"/*.list; do
     [ -f "$f" ] || continue
     sed -i '/\/video\//d' "$f"
 done
-
 echo "✅ 98-fix-apk-feeds: video feed 已清理"
 exit 0
