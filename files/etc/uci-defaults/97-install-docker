@@ -1,44 +1,35 @@
 #!/bin/sh
 # 97-install-docker
-# 等待 96-install-extras 安装好 dockerd 后，启用并启动 docker 服务
-# 96 先跑（数字小先执行），dockerd 二进制由 96 负责安装
+# dockerd 由 96-install-extras 后台安装
+# 本脚本只负责在系统启动后确保 dockerd 服务自启
+# 因为 96 是后台执行的，这里不需要等待
 
+# 把 dockerd 启动也放到后台，等 96 安装完再启动
+nohup sh -c '
 LOG_TAG="start-docker"
+log() { echo "[$(date +%H:%M:%S)] $1" | logger -t "$LOG_TAG"; }
 
-log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; echo "$1"; }
-
-# ── 等待 dockerd 二进制就位（最多等 120 秒）────────────────────
-log "⏳ 等待 dockerd 安装完成..."
-for i in $(seq 1 60); do
-    if command -v dockerd >/dev/null 2>&1; then
-        log "✅ dockerd 已就位（${i}x2 秒）"
-        break
-    fi
+# 等待 dockerd 二进制出现（最多等 5 分钟）
+for i in $(seq 1 150); do
+    command -v dockerd >/dev/null 2>&1 && break
     sleep 2
 done
 
 if ! command -v dockerd >/dev/null 2>&1; then
-    log "❌ dockerd 未找到，跳过启动（请检查 apk add dockerd 是否成功）"
+    log "❌ dockerd 未安装，跳过启动"
     exit 0
 fi
 
-# ── 挂载 cgroup2（Docker 必须）──────────────────────────────────
-if ! mount | grep -q cgroup2; then
-    mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null \
-        && log "✅ cgroup2 挂载成功" \
-        || log "⚠️  cgroup2 挂载失败（可能已由内核自动挂载）"
-fi
+# 挂载 cgroup2
+mount | grep -q cgroup2 || mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
 
-# ── 启用并启动 dockerd ───────────────────────────────────────────
-service dockerd enable 2>&1 | logger -t "$LOG_TAG"
-service dockerd start  2>&1 | logger -t "$LOG_TAG"
-
-# ── 等待服务就绪 ─────────────────────────────────────────────────
-sleep 5
-if service dockerd status 2>/dev/null | grep -q running; then
-    log "✅ dockerd 启动成功"
-else
-    log "⚠️  dockerd 未运行，请 SSH 执行: service dockerd start"
-fi
+# 启用并启动
+service dockerd enable 2>/dev/null
+service dockerd start  2>/dev/null
+sleep 3
+service dockerd status 2>/dev/null | grep -q running \
+    && log "✅ dockerd 启动成功" \
+    || log "⚠️  dockerd 未运行，请手动: service dockerd start"
+' >> /tmp/install-extras.log 2>&1 &
 
 exit 0
