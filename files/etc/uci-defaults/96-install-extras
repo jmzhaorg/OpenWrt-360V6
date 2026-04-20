@@ -1,97 +1,56 @@
 #!/bin/sh
 # 96-install-extras
-# 首次启动时安装编译期移出的大体积包
-# 执行顺序：96(本脚本) → 97(docker启动) → 98(fix feeds) → 99(自定义IP)
-# 注意：98-fix-apk-feeds 比本脚本晚执行，所以本脚本内部自己处理 video feed
+# 首次启动后台安装大体积包，不阻塞启动流程
+# 关键：用 nohup 后台运行，避免阻塞 uci-defaults 执行链
 
 LOG_TAG="install-extras"
 DONE_FLAG="/etc/install-extras-done"
+SCRIPT_SELF="/etc/uci-defaults/96-install-extras"
 
-log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; echo "$1"; }
-
-# 已执行过则跳过
+# 已完成则跳过
 [ -f "$DONE_FLAG" ] && exit 0
 
-# ── 修复 video feed（不依赖 98 先跑）────────────────────────────
+# ── 把真正的安装工作放到后台执行，uci-defaults 立即返回 ──────────
+# 这样不会阻塞 99-custom-ip 等后续脚本
+nohup sh -c '
+LOG_TAG="install-extras"
+DONE_FLAG="/etc/install-extras-done"
+
+log() { echo "[$(date +%H:%M:%S)] $1" | logger -t "$LOG_TAG"; }
+
+log "⏳ 等待系统启动完成..."
+sleep 30
+
+# 修复 video feed
 REPO_DIR="/etc/apk/repositories.d"
 for f in "$REPO_DIR"/*.list; do
-    [ -f "$f" ] && sed -i '/\/video\//d' "$f"
+    [ -f "$f" ] && sed -i "/\/video\//d" "$f"
 done
 
-# ── 等待网络就绪（最多 90 秒）────────────────────────────────────
-log "⏳ 等待网络就绪..."
-NETWORK_OK=0
-for i in $(seq 1 45); do
-    if ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1; then
-        log "✅ 网络就绪（约 ${i}x2 秒）"
-        NETWORK_OK=1
-        break
-    fi
+# 等待 WAN 网络就绪（最多等 3 分钟）
+log "⏳ 等待 WAN 网络..."
+for i in $(seq 1 90); do
+    ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && break
     sleep 2
 done
 
-if [ "$NETWORK_OK" = "0" ]; then
-    log "❌ 网络超时，跳过安装，下次启动重试"
-    exit 0
-fi
+# 更新索引
+apk update 2>/dev/null | logger -t "$LOG_TAG" || true
 
-# ── 更新软件源索引 ───────────────────────────────────────────────
-log "🔄 更新 apk 索引..."
-apk update 2>&1 | logger -t "$LOG_TAG"
+# 安装各包（逐个安装，失败不影响其他包）
+for pkg in "dockerd docker docker-compose cgroupfs-mount" "samba4-server" "adguardhome" "lucky luci-app-lucky luci-i18n-lucky-zh-cn" "luci-app-fileassistant"; do
+    log "📦 安装: $pkg"
+    apk add --no-cache $pkg 2>&1 | logger -t "$LOG_TAG" \
+        && log "✅ $pkg 安装完成" \
+        || log "⚠️  $pkg 安装失败"
+done
 
-# ── 安装 dockerd + docker-compose + cgroupfs ────────────────────
-log "📦 安装 dockerd..."
-apk add --no-cache \
-    dockerd \
-    docker \
-    docker-compose \
-    cgroupfs-mount \
-    2>&1 | logger -t "$LOG_TAG" \
-    && log "✅ dockerd 安装完成" \
-    || log "⚠️  dockerd 安装失败，稍后可手动执行: apk add dockerd docker docker-compose"
-
-# ── 安装 samba4-server ───────────────────────────────────────────
-log "📦 安装 samba4-server..."
-apk add --no-cache samba4-server 2>&1 | logger -t "$LOG_TAG" \
-    && log "✅ samba4-server 安装完成" \
-    || log "⚠️  samba4-server 安装失败，稍后可手动执行: apk add samba4-server"
-
-# ── 安装 adguardhome ─────────────────────────────────────────────
-log "📦 安装 adguardhome..."
-apk add --no-cache adguardhome 2>&1 | logger -t "$LOG_TAG" \
-    && log "✅ adguardhome 安装完成" \
-    || log "⚠️  adguardhome 安装失败，稍后可手动执行: apk add adguardhome"
-
-# ── 安装 Lucky ───────────────────────────────────────────────────
-log "📦 安装 lucky..."
-apk add --no-cache lucky luci-app-lucky luci-i18n-lucky-zh-cn \
-    2>&1 | logger -t "$LOG_TAG" \
-    && log "✅ lucky 安装完成" \
-    || log "⚠️  lucky 安装失败，稍后可手动执行: apk add lucky luci-app-lucky"
-
-# ── 安装 luci-app-fileassistant ──────────────────────────────────
-log "📦 安装 luci-app-fileassistant..."
-apk add --no-cache luci-app-fileassistant 2>&1 | logger -t "$LOG_TAG" \
-    && log "✅ luci-app-fileassistant 安装完成" \
-    || log "⚠️  luci-app-fileassistant 安装失败"
-
-# ── NSS 硬件加速（可选，失败不影响使用）────────────────────────
-log "📦 尝试安装 NSS 硬件加速..."
-apk add --no-cache \
-    kmod-qca-nss-drv \
-    kmod-qca-nss-gmac \
-    luci-app-nss-pbuf \
-    2>&1 | logger -t "$LOG_TAG" \
-    && log "✅ NSS 硬件加速安装完成" \
-    || log "ℹ️  NSS 包不在当前源中，跳过（SFE 软件加速已生效）"
-
-# ── 刷新 LuCI 缓存 ───────────────────────────────────────────────
+# 刷新 LuCI
 rm -f /tmp/luci-indexcache* 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null || true
-log "✅ LuCI 缓存已刷新"
 
-# ── 标记已完成，避免重复执行 ─────────────────────────────────────
 touch "$DONE_FLAG"
-log "🎉 96-install-extras 全部完成"
+log "🎉 install-extras 完成"
+' >> /tmp/install-extras.log 2>&1 &
 
 exit 0
