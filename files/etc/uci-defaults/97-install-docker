@@ -1,5 +1,6 @@
 #!/bin/sh
-# 97-install-docker
-# Docker 的安装与启动已整合到 96-install-extras 的 procd init 服务中
-# 此脚本保留为空操作，确保兼容性
+# 99-custom-ip - 设置 LAN IP 为 192.168.2.1
+uci set network.lan.ipaddr='192.168.2.1'
+uci set network.lan.netmask='255.255.255.0'
+uci commit network
 exit 0
