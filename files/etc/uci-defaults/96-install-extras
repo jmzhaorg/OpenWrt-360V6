@@ -1,20 +1,15 @@
 #!/bin/sh
 # 96-install-extras
 # 首次启动后台安装大体积包，不阻塞启动流程
-# 关键：用 nohup 后台运行，避免阻塞 uci-defaults 执行链
-
 LOG_TAG="install-extras"
 DONE_FLAG="/etc/install-extras-done"
-SCRIPT_SELF="/etc/uci-defaults/96-install-extras"
 
-# 已完成则跳过
 [ -f "$DONE_FLAG" ] && exit 0
 
-# ── 把真正的安装工作放到后台执行，uci-defaults 立即返回 ──────────
-# 这样不会阻塞 99-custom-ip 等后续脚本
 nohup sh -c '
 LOG_TAG="install-extras"
 DONE_FLAG="/etc/install-extras-done"
+[ -f "$DONE_FLAG" ] && exit 0
 
 log() { echo "[$(date +%H:%M:%S)] $1" | logger -t "$LOG_TAG"; }
 
@@ -35,7 +30,8 @@ for i in $(seq 1 90); do
 done
 
 # 更新索引
-apk update 2>/dev/null | logger -t "$LOG_TAG" || true
+apk update 2>&1 | logger -t "$LOG_TAG"
+true
 
 # 安装各包（逐个安装，失败不影响其他包）
 for pkg in "dockerd docker docker-compose cgroupfs-mount" "samba4-server" "adguardhome" "lucky luci-app-lucky luci-i18n-lucky-zh-cn" "luci-app-fileassistant"; do
