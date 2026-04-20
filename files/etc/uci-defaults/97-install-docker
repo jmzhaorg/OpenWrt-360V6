@@ -1,38 +1,5 @@
 #!/bin/sh
 # 97-install-docker
-# 等待 96 安装完 dockerd 后，负责启用并启动服务
-LOG_TAG="start-docker"
-DONE_FLAG="/etc/install-extras-done"
-
-nohup sh -c '
-LOG_TAG="start-docker"
-DONE_FLAG="/etc/install-extras-done"
-
-log() { echo "[$(date +%H:%M:%S)] $1" | logger -t "$LOG_TAG"; }
-
-# 等待 dockerd 二进制出现（最多等 5 分钟）
-log "⏳ 等待 dockerd 安装..."
-for i in $(seq 1 150); do
-    command -v dockerd >/dev/null 2>&1 && break
-    sleep 2
-done
-
-if ! command -v dockerd >/dev/null 2>&1; then
-    log "❌ dockerd 未安装，跳过启动"
-    exit 0
-fi
-
-# 挂载 cgroup2
-mount | grep -q cgroup2 || mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
-
-# 启用并启动
-/etc/init.d/dockerd enable 2>/dev/null || true
-/etc/init.d/dockerd start  2>/dev/null || true
-
-sleep 3
-/etc/init.d/dockerd status 2>/dev/null | grep -q running \
-    && log "✅ dockerd 启动成功" \
-    || log "⚠️  dockerd 未运行，请手动: /etc/init.d/dockerd start"
-' >> /tmp/install-extras.log 2>&1 &
-
+# Docker 的安装与启动已整合到 96-install-extras 的 procd init 服务中
+# 此脚本保留为空操作，确保兼容性
 exit 0
