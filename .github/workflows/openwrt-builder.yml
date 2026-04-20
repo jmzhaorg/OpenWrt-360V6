@@ -17,7 +17,6 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    # Docker + sing-box 体积大，编译时间长，480 分钟更稳妥
     timeout-minutes: 480
     permissions:
       contents: write
@@ -70,7 +69,6 @@ jobs:
           echo "✅ homeproxy 克隆完成"
 
           # ── Lucky（sirpdboy 版本含完整 OpenWrt Makefile）─────────────
-          # 优先检查 feeds 是否已包含，避免重复
           if find feeds -name "luci-app-lucky" -maxdepth 6 -type d 2>/dev/null | grep -q .; then
             echo "✅ luci-app-lucky 已在 feeds 中，跳过克隆"
           else
@@ -106,7 +104,7 @@ jobs:
             echo "✅ 已移除 sing-box-tiny"
           fi
 
-          # ── 2. 检查可选包是否存在（仅提示，不中断编译）──────────────
+          # ── 2. 检查可选包是否存在 ────────────────────────────────────
           for PKG in luci-app-fileassistant luci-app-crontabs luci-app-cpufreq \
                      luci-app-lucky luci-app-dockerman luci-app-nss-pbuf; do
             if find feeds package -name "$PKG" -maxdepth 6 -type d 2>/dev/null | grep -q .; then
@@ -126,11 +124,9 @@ jobs:
           # ── 4. 复制并清理配置 ────────────────────────────────────────
           cp "${GITHUB_WORKSPACE}/.config" .config
 
-          # 去掉旧的设备锁定 / PARTSIZE / luci-app-opkg 禁用行，防止冲突
           sed -i '/CONFIG_TARGET_.*DEVICE.*/d' .config
           sed -i '/CONFIG_TARGET_ROOTFS_PARTSIZE/d' .config
           sed -i '/# CONFIG_PACKAGE_luci-app-opkg is not set/d' .config
-          # 去掉旧版 docker 禁用（已在 .config 中用注释处理，此处兜底）
           sed -i '/^# CONFIG_PACKAGE_docker is not set/d' .config
 
           # 写入设备锁定（首行）
@@ -166,11 +162,6 @@ jobs:
           chmod +x files/etc/uci-defaults/97-install-docker
           chmod +x files/etc/uci-defaults/96-install-extras
           echo "✅ 预置配置文件已复制"
-          echo "=== 校验 uci-defaults 脚本 ==="
-          cat files/etc/uci-defaults/99-custom-ip
-          cat files/etc/uci-defaults/98-fix-apk-feeds
-          cat files/etc/uci-defaults/97-install-docker
-          cat files/etc/uci-defaults/96-install-extras
 
           # ── 8. 打印关键配置确认 ──────────────────────────────────────
           echo "=== 关键包配置确认 ==="
@@ -193,8 +184,15 @@ jobs:
         run: |
           cd openwrt
           make download -j$(nproc)
-          # 删除下载不完整的文件（小于 1KB）
           find dl -size -1024c -exec rm -f {} \;
+
+      - name: 🔍 检查固件体积预估
+        run: |
+          echo "=== dl 目录关键包大小 ==="
+          du -sh openwrt/dl/sing-box* openwrt/dl/adguardhome* \
+            openwrt/dl/samba4* openwrt/dl/dockerd* 2>/dev/null || true
+          echo "=== 磁盘剩余空间 ==="
+          df -h
 
       - name: 🔨 Compile Firmware
         id: compile
@@ -226,6 +224,23 @@ jobs:
             fi
           fi
 
+      - name: 🔍 检查固件实际大小
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          echo "=== 所有生成固件文件 ==="
+          find openwrt/bin/targets -type f | sort
+          echo "=== 固件大小详情 ==="
+          find openwrt/bin/targets -name "*.bin" -o -name "*.ubi" -o -name "*.img" \
+            2>/dev/null | xargs ls -lh 2>/dev/null || true
+          echo "=== squashfs 体积检查（超过 55MB 请关注）==="
+          find openwrt/bin/targets -name "*squashfs*" 2>/dev/null | while read f; do
+            SIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            MB=$(( SIZE / 1024 / 1024 ))
+            echo "$f: ${MB}MB"
+            if [ "$SIZE" -gt 57671680 ]; then
+              echo "⚠️  警告：固件超过 55MB，360V6 NAND 128MB 可能装不下！"
+            fi
+          done
 
       - name: 📦 Prepare Artifacts
         if: steps.compile.outputs.status == 'success'
@@ -264,35 +279,32 @@ jobs:
 
             ### ✨ 已内置功能
             - ✅ 中文界面 + Argon 主题
-            - ✅ HomeProxy + sing-box 代理
+            - ✅ HomeProxy（sing-box 运行时安装）
             - ✅ ttyd 网页终端
-            - ✅ ath11k 无线驱动（AX1800）
+            - ✅ ath11k 无线驱动（AX1800，IPQ6000 内置）
             - ✅ USB 存储自动挂载 + ext4/NTFS3 + DiskMan
             - ✅ USB 硬盘健康检测 smartmontools
-            - ✅ Samba4 文件共享（局域网 NAS）
-            - ✅ 文件管理器 fileassistant
+            - ✅ Samba4 文件共享（运行时安装）
+            - ✅ 文件管理器 fileassistant（运行时安装）
             - ✅ 网络唤醒 WOL
             - ✅ 定时重启 + 计划任务界面
-            - ✅ AdGuard Home 广告过滤
+            - ✅ AdGuard Home（运行时安装）
             - ✅ SmartDNS 国内 DNS 加速
             - ✅ DDNS 动态域名（含 Cloudflare 脚本）
             - ✅ UPnP 自动端口映射
             - ✅ 流量监控 nlbwmon
             - ✅ IPv6 支持（含 ipv6helper 一键配置）
-            - ✅ BBR 拥塞控制 + SFE 软件硬件加速
+            - ✅ BBR 拥塞控制 + SFE 软件加速
             - ✅ 网络诊断工具 mtr / tcpdump
             - ✅ CPU 频率调节
-            - ✅ Docker + dockerman 容器管理
-            - ✅ Lucky 内网穿透 / 反向代理
-            - ✅ 软件源管理（opkg / LuCI 软件源界面）
+            - ✅ Docker + dockerman（运行时安装）
+            - ✅ Lucky 内网穿透（运行时安装）
 
             ### 📌 默认信息
             - 管理地址：**http://192.168.2.1**
             - 用户名：root，密码：无（首次登录请立即设置密码）
+            - 首次启动约 3-5 分钟后自动安装 Docker/AdGuard/Samba 等大包
             - SSH：`apk update && apk upgrade` 即可更新软件包
-            - IPv6：需在 LuCI → 网络 → IPv6 Helper 中开启
-            - Samba：需在 LuCI → 服务 → 网络共享 中配置共享路径
-            - NSS 加速：若出现稳定性问题可 SSH 执行 `apk del kmod-qca-nss-drv`
 
           files: ${{ env.FIRMWARE_PATH }}/*
           draft: false
@@ -307,7 +319,7 @@ jobs:
           ls -lh openwrt/build.log openwrt/build-verbose.log 2>/dev/null || true
           echo "=== build.log 最后 50 行 ==="
           tail -50 openwrt/build.log 2>/dev/null || echo "(无日志)"
-          echo "=== build-verbose.log 最后 150 行（含详细错误）==="
+          echo "=== build-verbose.log 最后 150 行 ==="
           tail -150 openwrt/build-verbose.log 2>/dev/null || echo "(无详细日志，说明多线程已成功)"
           echo "=== bin 目录完整内容 ==="
           find openwrt/bin -type f | sort
