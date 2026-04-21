@@ -209,8 +209,7 @@ jobs:
 
           # ── 8. 打印关键配置确认 ────────────────────────────────────
           echo "=== 关键包配置 ==="
-          grep -E "netifd|homeproxy|sing-box|ath11k|kmod-sfe|kmod-fast-classifier|\
-firewall4|dnsmasq|smartdns|PARTSIZE|SQUASHFS|UBIFS|dockerman|BBR" \
+          grep -E "netifd|homeproxy|sing-box|ath11k|kmod-sfe|kmod-fast-classifier|firewall4|dnsmasq|smartdns|PARTSIZE|SQUASHFS|UBIFS|dockerman|BBR" \
             .config | grep -v "^#" | sort || true
           echo "=== 已禁用包确认 ==="
           grep -E "kmod-sfe|kmod-fast-classifier|kmod-ip6tables|ath11k-firmware-qcn" \
