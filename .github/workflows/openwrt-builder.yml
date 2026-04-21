@@ -279,14 +279,15 @@ jobs:
             SIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
             MB=$(( SIZE / 1024 / 1024 ))
             echo "  $f : ${MB} MB"
-            # 360V6 NAND 128MB，kernel+rootfs 分区约 100MB 上限
-            if [ "$SIZE" -gt 104857600 ]; then
-              echo "  ❌ 超过 100MB 上限，刷入后极可能变砖！"
+            # 360V6 NAND 128MB，squashfs+kernel 安全上限约 90MB
+            # 目标 <60MB，给 overlay 留足空间
+            if [ "$SIZE" -gt 94371840 ]; then
+              echo "  ❌ 超过 90MB 硬上限，极可能变砖，终止发布！"
               exit 1
-            elif [ "$SIZE" -gt 78643200 ]; then
-              echo "  ⚠️  超过 75MB，接近风险线，建议精简"
+            elif [ "$SIZE" -gt 62914560 ]; then
+              echo "  ⚠️  超过 60MB 建议值，overlay 空间不足，建议继续精简"
             else
-              echo "  ✅ 体积安全"
+              echo "  ✅ 体积安全（目标 <60MB）"
             fi
           done
 
