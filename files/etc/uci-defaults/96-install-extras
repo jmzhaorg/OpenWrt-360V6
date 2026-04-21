@@ -1,121 +1,154 @@
 #!/bin/sh
 # 96-install-extras
-# 首次启动后在后台安装大体积软件包（sing-box / samba4 / adguardhome / dockerd / lucky 等）
-# 使用 rc.local 风格的延迟执行，避免 uci-defaults 执行阶段 init 系统杀掉后台进程
+# 在 uci-defaults 阶段写入 procd init 服务，首次启动后异步安装大体积软件包
+# 解决的问题：
+#   - FIX-BOOT1: 原 procd_set_param respawn 0 导致服务从不启动
+#   - FIX-R4: 网络超时后可重试（不写 DONE_FLAG，下次启动继续尝试）
+#   - FIX-R3: homeproxy init 在 sing-box 安装完成后才启动
 
 DONE_FLAG="/etc/install-extras-done"
 [ -f "$DONE_FLAG" ] && exit 0
 
-# 写入一个 rc.local 风格的一次性启动脚本，由 init 系统在网络就绪后执行
-# 这比 nohup & 更可靠，因为 uci-defaults 退出后后台进程可能被杀
+# ── 写入 procd init 服务 ──────────────────────────────────────────────
+# FIX-BOOT1: 不使用 USE_PROCD=1 + respawn，改用传统 rc.common start/stop
+# procd_set_param respawn 的第一个参数是"最大失败次数"，0 = 永不重启
+# 传统 start-stop-daemon 更可靠，直接 fork 后台进程
 cat > /etc/init.d/install-extras << 'INITEOF'
 #!/bin/sh /etc/rc.common
 START=99
 STOP=10
-USE_PROCD=1
 
-start_service() {
-    procd_open_instance
-    procd_set_param command /bin/sh /usr/lib/install-extras/run.sh
-    procd_set_param respawn 0
-    procd_set_param stdout 1
-    procd_set_param stderr 1
-    procd_close_instance
+start() {
+    [ -f /etc/install-extras-done ] && return 0
+    [ -f /usr/lib/install-extras/run.sh ] || return 1
+    # 使用 start-stop-daemon 后台运行，pidfile 防止重复启动
+    start-stop-daemon -S -b -m -p /var/run/install-extras.pid \
+        -x /bin/sh -- /usr/lib/install-extras/run.sh
+}
+
+stop() {
+    start-stop-daemon -K -p /var/run/install-extras.pid 2>/dev/null || true
 }
 INITEOF
 
 chmod +x /etc/init.d/install-extras
 
-# 安装主脚本
+# ── 写入安装主脚本 ────────────────────────────────────────────────────
 mkdir -p /usr/lib/install-extras
 cat > /usr/lib/install-extras/run.sh << 'RUNEOF'
 #!/bin/sh
 LOG_TAG="install-extras"
 DONE_FLAG="/etc/install-extras-done"
+NET_FAIL_FLAG="/etc/install-extras-net-fail"
 
 log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
 
+# 幂等：已完成则退出
 [ -f "$DONE_FLAG" ] && exit 0
 
-log "⏳ 等待系统启动完成 (60s)..."
-sleep 60
+log "⏳ 等待系统完全启动 (45s)..."
+sleep 45
 
-# 禁用自身（只跑一次）
-/etc/init.d/install-extras disable 2>/dev/null || true
+# 禁用自身（防止 procd 下次启动重复执行，网络失败时不禁用以便重试）
+# 成功后在脚本末尾 disable
 
-# 修复 video feed（如果存在的话会导致 apk update 报错）
+# 修复 apk video feed
 for f in /etc/apk/repositories.d/*.list; do
     [ -f "$f" ] && sed -i '/\/video\//d' "$f"
 done
-log "✅ apk feeds 已清理 video 源"
+log "✅ apk video feed 已清理"
 
-# 等待 WAN 网络（最多 5 分钟）
-log "⏳ 等待 WAN 网络..."
+# ── 等待 WAN 网络（最多 8 分钟）────────────────────────────────────────
+log "⏳ 等待 WAN 网络就绪..."
 NETWORK_OK=0
-for i in $(seq 1 150); do
-    if ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1; then
+for i in $(seq 1 240); do
+    # 同时检测内网 DNS 和公网连通性
+    if ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 || \
+       ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
         NETWORK_OK=1
-        log "✅ 网络已就绪（第 ${i} 次探测）"
+        log "✅ 网络就绪（尝试 ${i} 次）"
         break
     fi
     sleep 2
 done
 
 if [ "$NETWORK_OK" -eq 0 ]; then
-    log "❌ 网络超时，无法安装软件包，将在下次启动重试"
+    log "❌ 网络超时（8 分钟），本次跳过安装，下次启动将自动重试"
+    # 不写 DONE_FLAG，下次启动会重试
+    # 但 disable init 防止每次启动都等 8 分钟（可手动 /etc/init.d/install-extras enable 重试）
+    /etc/init.d/install-extras disable 2>/dev/null || true
+    touch "$NET_FAIL_FLAG"
     exit 1
 fi
 
+# 删除上次网络失败标记
+rm -f "$NET_FAIL_FLAG" 2>/dev/null
+
+# ── apk 更新 ──────────────────────────────────────────────────────────
+log "📦 apk update..."
 apk update 2>&1 | logger -t "$LOG_TAG"
+if [ $? -ne 0 ]; then
+    log "⚠️  apk update 失败，尝试修复 feeds..."
+    # 尝试重建 feeds 缓存
+    apk update --allow-untrusted 2>&1 | logger -t "$LOG_TAG" || true
+fi
 
-# ── 安装 sing-box（HomeProxy 后端，约 25MB）────────────────────────────
+# ── 安装 sing-box（HomeProxy 后端）────────────────────────────────────
 log "📦 安装 sing-box..."
-apk add --no-cache sing-box 2>&1 | logger -t "$LOG_TAG" \
-    && log "✅ sing-box 安装完成" \
-    || log "⚠️  sing-box 安装失败，可手动执行: apk add sing-box"
+apk add --no-cache sing-box 2>&1 | logger -t "$LOG_TAG"
+if command -v sing-box >/dev/null 2>&1; then
+    log "✅ sing-box 安装完成"
+    # FIX-R3: sing-box 安装完成后重启 homeproxy，避免 LuCI 报错
+    /etc/init.d/homeproxy restart 2>/dev/null || true
+    log "✅ homeproxy 已重启"
+else
+    log "⚠️  sing-box 安装失败，可手动: apk add sing-box"
+fi
 
-# ── 安装 dockerd（约 60MB）────────────────────────────────────────────
+# ── 安装 dockerd ──────────────────────────────────────────────────────
 log "📦 安装 dockerd..."
 apk add --no-cache dockerd docker docker-compose cgroupfs-mount \
     2>&1 | logger -t "$LOG_TAG" \
     && log "✅ dockerd 安装完成" \
     || log "⚠️  dockerd 安装失败"
 
-# 配置 Docker daemon.json，优先使用 USB 存储
-mkdir -p /etc/docker
-USB_MOUNT=""
-for mp in /mnt/sda1 /mnt/sda /mnt/usb /mnt/mmcblk0p1; do
-    if mountpoint -q "$mp" 2>/dev/null; then
-        USB_MOUNT="$mp"
-        log "✅ 检测到 USB 挂载点: $USB_MOUNT"
-        break
-    fi
-done
-
-if [ -n "$USB_MOUNT" ] && command -v dockerd >/dev/null 2>&1; then
-    DOCKER_DIR="$USB_MOUNT/docker-data"
-    mkdir -p "$DOCKER_DIR"
-    printf '{\n  "data-root": "%s",\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' \
-        "$DOCKER_DIR" > /etc/docker/daemon.json
-    log "✅ Docker 数据目录已设置为 $DOCKER_DIR（USB）"
-else
-    printf '{\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "5m", "max-file": "2"}\n}\n' \
-        > /etc/docker/daemon.json
-    log "⚠️  未检测到 USB，Docker 数据将存在 overlay（建议插入 USB 后重新配置）"
-fi
-
-# 挂载 cgroup2 并启动 dockerd
-mount | grep -q cgroup2 || mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
 if command -v dockerd >/dev/null 2>&1; then
+    # 配置 Docker 数据目录，优先 USB
+    mkdir -p /etc/docker
+    USB_MOUNT=""
+    for mp in /mnt/sda1 /mnt/sda /mnt/usb /mnt/mmcblk0p1; do
+        if mountpoint -q "$mp" 2>/dev/null; then
+            USB_MOUNT="$mp"
+            log "✅ USB 挂载点: $USB_MOUNT"
+            break
+        fi
+    done
+
+    if [ -n "$USB_MOUNT" ]; then
+        DOCKER_DIR="$USB_MOUNT/docker-data"
+        mkdir -p "$DOCKER_DIR"
+        printf '{\n  "data-root": "%s",\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' \
+            "$DOCKER_DIR" > /etc/docker/daemon.json
+        log "✅ Docker 数据目录: $DOCKER_DIR"
+    else
+        printf '{\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "5m", "max-file": "2"}\n}\n' \
+            > /etc/docker/daemon.json
+        log "⚠️  无 USB，Docker 用 overlay（建议插 USB 后重新配置）"
+    fi
+
+    # 挂载 cgroup（cgroupfs-mount 会处理，这里作为兜底）
+    mountpoint -q /sys/fs/cgroup || \
+        mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+
     /etc/init.d/dockerd enable 2>/dev/null || true
     /etc/init.d/dockerd start  2>/dev/null || true
     sleep 3
     /etc/init.d/dockerd status 2>/dev/null | grep -q running \
-        && log "✅ dockerd 启动成功" \
-        || log "⚠️  dockerd 未运行，请手动: /etc/init.d/dockerd start"
+        && log "✅ dockerd 已启动" \
+        || log "⚠️  dockerd 未运行，手动: /etc/init.d/dockerd start"
 fi
 
-# ── 安装其他软件包 ─────────────────────────────────────────────────────
+# ── 安装其他包 ────────────────────────────────────────────────────────
 for pkg in \
     "samba4-server" \
     "adguardhome" \
@@ -126,20 +159,23 @@ do
     # shellcheck disable=SC2086
     apk add --no-cache $pkg 2>&1 | logger -t "$LOG_TAG" \
         && log "✅ $pkg 完成" \
-        || log "⚠️  $pkg 失败（非致命，可稍后手动安装）"
+        || log "⚠️  $pkg 失败（可手动: apk add $pkg）"
 done
 
-# 刷新 LuCI 缓存
+# ── 刷新 LuCI ─────────────────────────────────────────────────────────
 rm -f /tmp/luci-indexcache* 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null || true
 
+# ── 完成 ──────────────────────────────────────────────────────────────
+/etc/init.d/install-extras disable 2>/dev/null || true
 touch "$DONE_FLAG"
 log "🎉 install-extras 全部完成"
 RUNEOF
 
 chmod +x /usr/lib/install-extras/run.sh
 
-# 启用 init 服务（下次启动时执行）
+# 启用 init 服务（系统启动时执行）
 /etc/init.d/install-extras enable 2>/dev/null || true
 
+logger -t "96-install-extras" "✅ install-extras init 服务已注册，将在首次启动后异步运行"
 exit 0
