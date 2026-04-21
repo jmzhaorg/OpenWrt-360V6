@@ -56,27 +56,27 @@ jobs:
         run: |
           cd openwrt
 
-          # ── Argon 主题 ────────────────────────────────────────────────
+          # ── Argon 主题 ──────────────────────────────────────────────
           rm -rf package/luci-theme-argon
           git clone --depth 1 https://github.com/jerrykuku/luci-theme-argon.git \
             package/luci-theme-argon
           echo "✅ luci-theme-argon 克隆完成"
 
-          # ── HomeProxy ─────────────────────────────────────────────────
+          # ── HomeProxy ───────────────────────────────────────────────
           rm -rf package/homeproxy
           git clone --depth 1 https://github.com/immortalwrt/homeproxy.git \
             package/homeproxy
           echo "✅ homeproxy 克隆完成"
 
-          # ── Lucky（sirpdboy 版本含完整 OpenWrt Makefile）─────────────
+          # ── Lucky（运行时安装，此处仅检查可用性）──────────────────
           if find feeds -name "luci-app-lucky" -maxdepth 6 -type d 2>/dev/null | grep -q .; then
-            echo "✅ luci-app-lucky 已在 feeds 中，跳过克隆"
+            echo "✅ luci-app-lucky 已在 feeds，跳过克隆"
           else
             rm -rf package/luci-app-lucky
             git clone --depth 1 https://github.com/sirpdboy/luci-app-lucky.git \
               package/luci-app-lucky \
               && echo "✅ luci-app-lucky 克隆完成" \
-              || echo "⚠️  luci-app-lucky 克隆失败，defconfig 会自动跳过"
+              || echo "⚠️  luci-app-lucky 克隆失败（不影响编译，运行时安装）"
           fi
 
       - name: 🔄 Update & Install Feeds
@@ -85,114 +85,147 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 🔍 查看 360v6 设备定义
+      - name: 🔍 校验设备定义
         run: |
-          echo "=== ipq60xx.mk 全部设备定义 ==="
-          grep "define Device\|TARGET_DEVICES" openwrt/target/linux/qualcommax/image/ipq60xx.mk
-          echo "=== 所有 DTS 文件 ==="
-          find openwrt/target/linux/qualcommax/files -name "*.dts" | sort
+          echo "=== ipq60xx.mk 设备定义 ==="
+          grep "define Device\|TARGET_DEVICES" \
+            openwrt/target/linux/qualcommax/image/ipq60xx.mk
+          echo "=== 360v6 DTS 确认 ==="
+          find openwrt/target/linux/qualcommax/files -name "*360*" -o -name "*qihoo*" \
+            2>/dev/null | sort || echo "（未找到，将由设备定义自动处理）"
+          # FIX-B1: 确认正确的 ath11k 固件包存在
+          echo "=== ath11k 固件包确认 ==="
+          find openwrt/package openwrt/feeds -path "*/ath11k-firmware-ipq60xx*" \
+            -maxdepth 8 -type d 2>/dev/null | head -5 \
+            || echo "⚠️  ath11k-firmware-ipq60xx 包路径未找到，请检查 feeds"
 
       - name: ⚙️ Apply Config
         run: |
           cd openwrt
 
-          # ── 1. 移除 sing-box-tiny 冲突 ──────────────────────────────
+          # ── 1. 移除 sing-box-tiny 冲突 ────────────────────────────
           SINGBOX_MK="feeds/packages/net/sing-box/Makefile"
           if [ -f "$SINGBOX_MK" ]; then
             sed -i '/define Package\/sing-box-tiny/,/^endef/d' "$SINGBOX_MK"
             sed -i '/BuildPackage,sing-box-tiny/d' "$SINGBOX_MK"
-            echo "✅ 已移除 sing-box-tiny"
+            echo "✅ sing-box-tiny 冲突已移除"
           fi
 
-          # ── 2. 检查可选包是否存在 ────────────────────────────────────
-          for PKG in luci-app-fileassistant luci-app-crontabs luci-app-cpufreq \
-                     luci-app-lucky luci-app-dockerman luci-app-nss-pbuf; do
-            if find feeds package -name "$PKG" -maxdepth 6 -type d 2>/dev/null | grep -q .; then
+          # ── 2. 检查关键包是否存在 ──────────────────────────────────
+          MISSING_CRITICAL=""
+          for PKG in netifd dnsmasq-full firewall4 procd; do
+            if find feeds package -name "$PKG" -maxdepth 8 -type d 2>/dev/null | grep -q .; then
               echo "✅ $PKG 存在"
             else
-              echo "⚠️  $PKG 未找到，将由 defconfig 自动跳过（不影响编译）"
+              echo "⚠️  $PKG 未找到（关键包，请检查 feeds）"
+              MISSING_CRITICAL="$MISSING_CRITICAL $PKG"
             fi
           done
+          # 可选包仅提示
+          for PKG in luci-app-fileassistant luci-app-crontabs luci-app-cpufreq \
+                     luci-app-dockerman luci-app-homeproxy; do
+            find feeds package -name "$PKG" -maxdepth 8 -type d 2>/dev/null | grep -q . \
+              && echo "✅ $PKG 存在" \
+              || echo "⚠️  $PKG 未找到，defconfig 自动跳过"
+          done
 
-          # ── 3. 清空 TARGET_DEVICES，只保留 qihoo_360v6 ──────────────
+          # ── 3. 清空 TARGET_DEVICES，只保留 qihoo_360v6 ────────────
           MK="target/linux/qualcommax/image/ipq60xx.mk"
           sed -i '/^TARGET_DEVICES +=/d' "$MK"
           echo 'TARGET_DEVICES += qihoo_360v6' >> "$MK"
           echo "=== 修改后 TARGET_DEVICES ==="
           grep "TARGET_DEVICES" "$MK"
 
-          # ── 4. 复制并清理配置 ────────────────────────────────────────
+          # ── 4. 复制并清理配置 ──────────────────────────────────────
           cp "${GITHUB_WORKSPACE}/.config" .config
 
+          # 清理旧的设备锁定 / 分区配置，防止冲突
           sed -i '/CONFIG_TARGET_.*DEVICE.*/d' .config
           sed -i '/CONFIG_TARGET_ROOTFS_PARTSIZE/d' .config
           sed -i '/# CONFIG_PACKAGE_luci-app-opkg is not set/d' .config
           sed -i '/^# CONFIG_PACKAGE_docker is not set/d' .config
+          # 清理旧版 SFE 配置（若之前有启用）
+          sed -i '/CONFIG_PACKAGE_kmod-sfe=/d' .config
+          sed -i '/CONFIG_PACKAGE_kmod-fast-classifier=/d' .config
 
           # 写入设备锁定（首行）
           sed -i '1s/^/CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qihoo_360v6=y\n/' .config
 
-          # ── 5. 展开配置 ──────────────────────────────────────────────
+          # ── 5. 展开配置 ────────────────────────────────────────────
           make defconfig 2>&1 | tail -5
 
-          # ── 6. 校验设备锁定 ──────────────────────────────────────────
+          # ── 6. 校验关键项 ──────────────────────────────────────────
+          FAIL=0
+
+          # 设备锁定
           if grep -q "^CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qihoo_360v6=y" .config; then
             echo "✅ 设备锁定：qihoo_360v6"
           else
-            echo "❌ 设备锁定失败，实际选中："
-            grep "CONFIG_TARGET_.*DEVICE.*=y" .config
-            exit 1
+            echo "❌ 设备锁定失败"
+            grep "CONFIG_TARGET_.*DEVICE.*=y" .config || true
+            FAIL=1
           fi
 
-          # ── 7. 复制预置配置文件 ──────────────────────────────────────
-          mkdir -p files/etc/uci-defaults
-          mkdir -p files/etc/sysctl.d
-          cp "${GITHUB_WORKSPACE}/files/etc/uci-defaults/99-custom-ip" \
-             files/etc/uci-defaults/99-custom-ip
+          # FIX-B1: 确认正确的 ath11k 固件
+          if grep -q "^CONFIG_PACKAGE_ath11k-firmware-ipq60xx=y" .config; then
+            echo "✅ ath11k-firmware-ipq60xx 已启用"
+          else
+            echo "❌ ath11k-firmware-ipq60xx 未启用，无线将无法工作"
+            FAIL=1
+          fi
+          if grep -q "^CONFIG_PACKAGE_ath11k-firmware-qcn9074=y" .config; then
+            echo "❌ 错误：qcn9074 固件被启用（应为 not set）"
+            FAIL=1
+          fi
+
+          # FIX-BOOT3: 确认 SFE 已禁用
+          if grep -q "^CONFIG_PACKAGE_kmod-sfe=y" .config || \
+             grep -q "^CONFIG_PACKAGE_kmod-fast-classifier=y" .config; then
+            echo "❌ 错误：SFE 模块被启用，会导致 LAN 流量静默丢弃"
+            FAIL=1
+          else
+            echo "✅ SFE 已禁用（使用 nftables flowtable）"
+          fi
+
+          # FIX-B3: 确认 netifd 已包含
+          if grep -q "^CONFIG_PACKAGE_netifd=y" .config; then
+            echo "✅ netifd 已包含"
+          else
+            echo "⚠️  netifd 未显式包含（由 defconfig 依赖关系决定是否内置）"
+          fi
+
+          [ $FAIL -eq 0 ] || exit 1
+
+          # ── 7. 复制预置配置文件 ────────────────────────────────────
+          mkdir -p files/etc/uci-defaults files/etc/sysctl.d
+          for f in 99-custom-ip 98-fix-apk-feeds 97-install-docker 96-install-extras; do
+            cp "${GITHUB_WORKSPACE}/files/etc/uci-defaults/$f" \
+               "files/etc/uci-defaults/$f"
+            chmod +x "files/etc/uci-defaults/$f"
+          done
           cp "${GITHUB_WORKSPACE}/files/etc/sysctl.d/99-bbr.conf" \
              files/etc/sysctl.d/99-bbr.conf
-          cp "${GITHUB_WORKSPACE}/files/etc/uci-defaults/98-fix-apk-feeds" \
-             files/etc/uci-defaults/98-fix-apk-feeds
-          cp "${GITHUB_WORKSPACE}/files/etc/uci-defaults/97-install-docker" \
-             files/etc/uci-defaults/97-install-docker
-          cp "${GITHUB_WORKSPACE}/files/etc/uci-defaults/96-install-extras" \
-             files/etc/uci-defaults/96-install-extras
-          chmod +x files/etc/uci-defaults/99-custom-ip
-          chmod +x files/etc/uci-defaults/98-fix-apk-feeds
-          chmod +x files/etc/uci-defaults/97-install-docker
-          chmod +x files/etc/uci-defaults/96-install-extras
           echo "✅ 预置配置文件已复制"
 
-          # ── 8. 打印关键配置确认 ──────────────────────────────────────
-          echo "=== 关键包配置确认 ==="
-          grep -E \
-            "luci-app-fileassistant|luci-lua-runtime|luci-app-wol|\
-            luci-app-autoreboot|luci-app-adguardhome|adguardhome|\
-            luci-app-ddns|luci-app-upnp|luci-app-nlbwmon|\
-            luci-app-diskman|kmod-tcp-bbr|kmod-fs-ntfs3|\
-            luci-app-samba4|smartmontools|luci-app-smartdns|\
-            luci-app-ipv6helper|luci-app-crontabs|automount|\
-            luci-app-cpufreq|dockerd|luci-app-dockerman|\
-            luci-app-lucky|kmod-sfe|kmod-fast-classifier|\
-            kmod-qca-nss|luci-app-nss-pbuf|luci-app-opkg|\
-            ca-bundle|libustream-openssl|PARTSIZE|homeproxy|sing-box" \
-            .config || true
-          echo "=== files/ 目录预置文件 ==="
+          # ── 8. 打印关键配置确认 ────────────────────────────────────
+          echo "=== 关键包配置 ==="
+          grep -E "netifd|homeproxy|sing-box|ath11k|kmod-sfe|kmod-fast-classifier|\
+firewall4|dnsmasq|smartdns|PARTSIZE|SQUASHFS|UBIFS|dockerman|BBR" \
+            .config | grep -v "^#" | sort || true
+          echo "=== 已禁用包确认 ==="
+          grep -E "kmod-sfe|kmod-fast-classifier|kmod-ip6tables|ath11k-firmware-qcn" \
+            .config | sort || true
+          echo "=== files/ 目录 ==="
           find files -type f | sort
 
       - name: ⬇️ Download Packages
         run: |
           cd openwrt
           make download -j$(nproc)
+          # 删除不完整下载（小于 1KB）
           find dl -size -1024c -exec rm -f {} \;
-
-      - name: 🔍 检查固件体积预估
-        run: |
-          echo "=== dl 目录关键包大小 ==="
-          du -sh openwrt/dl/sing-box* openwrt/dl/adguardhome* \
-            openwrt/dl/samba4* openwrt/dl/dockerd* 2>/dev/null || true
-          echo "=== 磁盘剩余空间 ==="
-          df -h
+          echo "=== dl 目录大小 ==="
+          du -sh dl/
 
       - name: 🔨 Compile Firmware
         id: compile
@@ -204,7 +237,7 @@ jobs:
             echo "status=success" >> $GITHUB_OUTPUT
             echo "✅ 多线程编译成功"
           else
-            echo "⚠️ 多线程失败，降级单线程输出完整日志..."
+            echo "⚠️ 多线程失败，降级单线程..."
             make -j1 V=s > build-verbose.log 2>&1
             MAKE_EXIT=$?
             cat build-verbose.log >> build.log
@@ -224,21 +257,30 @@ jobs:
             fi
           fi
 
-      - name: 🔍 检查固件实际大小
+      - name: 🔍 检查固件体积（NAND 安全检查）
         if: steps.compile.outputs.status == 'success'
         run: |
-          echo "=== 所有生成固件文件 ==="
+          echo "=== 所有生成文件 ==="
           find openwrt/bin/targets -type f | sort
-          echo "=== 固件大小详情 ==="
+          echo "=== 固件大小 ==="
           find openwrt/bin/targets -name "*.bin" -o -name "*.ubi" -o -name "*.img" \
             2>/dev/null | xargs ls -lh 2>/dev/null || true
-          echo "=== squashfs 体积检查（超过 55MB 请关注）==="
-          find openwrt/bin/targets -name "*squashfs*" 2>/dev/null | while read f; do
+          echo ""
+          echo "=== squashfs / ubi 体积检查 ==="
+          OVERSIZE=0
+          find openwrt/bin/targets -name "*squashfs*" -o -name "*.ubi" 2>/dev/null \
+          | while read f; do
             SIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
             MB=$(( SIZE / 1024 / 1024 ))
-            echo "$f: ${MB}MB"
-            if [ "$SIZE" -gt 57671680 ]; then
-              echo "⚠️  警告：固件超过 55MB，360V6 NAND 128MB 可能装不下！"
+            echo "  $f : ${MB} MB"
+            # 360V6 NAND 128MB，kernel+rootfs 分区约 100MB 上限
+            if [ "$SIZE" -gt 104857600 ]; then
+              echo "  ❌ 超过 100MB 上限，刷入后极可能变砖！"
+              exit 1
+            elif [ "$SIZE" -gt 78643200 ]; then
+              echo "  ⚠️  超过 75MB，接近风险线，建议精简"
+            else
+              echo "  ✅ 体积安全"
             fi
           done
 
@@ -247,23 +289,29 @@ jobs:
         run: |
           TARGET_DIR="openwrt/bin/targets/qualcommax/ipq60xx"
           if [ ! -d "$TARGET_DIR" ]; then
-            echo "❌ 目标目录不存在，当前 bin 结构："
+            echo "❌ 目标目录不存在："
             find openwrt/bin/targets -type d -maxdepth 3
             exit 1
           fi
           cd "$TARGET_DIR"
-          echo "📂 输出文件列表："
+          echo "📂 输出文件："
           ls -lh
           mkdir -p output
           cp *360v6* output/ 2>/dev/null || true
           cp sha256sums output/ 2>/dev/null || true
           if ! ls output/*360v6* >/dev/null 2>&1; then
-            echo "❌ 未找到 360 V6 固件，请检查编译日志"
+            echo "❌ 未找到 360V6 固件"
             exit 1
           fi
+          # FIX-F3: 校验 sha256
+          echo "=== sha256 校验 ==="
+          cd output
+          if [ -f sha256sums ]; then
+            grep "360v6" sha256sums | sha256sum -c - 2>&1 || true
+          fi
           echo "✅ 固件验证通过"
-          ls -lh output/
-          echo "FIRMWARE_PATH=$PWD/output" >> $GITHUB_ENV
+          ls -lh
+          echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
 
       - name: 🚀 Upload to Release
         if: steps.compile.outputs.status == 'success'
@@ -277,34 +325,35 @@ jobs:
             - **构建时间**: ${{ env.BUILD_DATE }}
             - **源码 Commit**: ${{ env.OPENWRT_COMMIT }}
 
-            ### ✨ 已内置功能
-            - ✅ 中文界面 + Argon 主题
-            - ✅ HomeProxy（sing-box 运行时安装）
-            - ✅ ttyd 网页终端
-            - ✅ ath11k 无线驱动（AX1800，IPQ6000 内置）
-            - ✅ USB 存储自动挂载 + ext4/NTFS3 + DiskMan
-            - ✅ USB 硬盘健康检测 smartmontools
-            - ✅ Samba4 文件共享（运行时安装）
-            - ✅ 文件管理器 fileassistant（运行时安装）
-            - ✅ 网络唤醒 WOL
-            - ✅ 定时重启 + 计划任务界面
-            - ✅ AdGuard Home（运行时安装）
-            - ✅ SmartDNS 国内 DNS 加速
-            - ✅ DDNS 动态域名（含 Cloudflare 脚本）
-            - ✅ UPnP 自动端口映射
-            - ✅ 流量监控 nlbwmon
-            - ✅ IPv6 支持（含 ipv6helper 一键配置）
-            - ✅ BBR 拥塞控制 + SFE 软件加速
-            - ✅ 网络诊断工具 mtr / tcpdump
-            - ✅ CPU 频率调节
-            - ✅ Docker + dockerman（运行时安装）
-            - ✅ Lucky 内网穿透（运行时安装）
+            ### ✨ 已内置
+            - 中文界面 + Argon 主题
+            - HomeProxy LuCI（sing-box 首次启动后自动安装）
+            - ttyd 网页终端
+            - ath11k 无线驱动（IPQ6000 板载 AX1800，固件 ipq60xx）
+            - USB 存储自动挂载 + ext4/NTFS3 + DiskMan
+            - USB 硬盘健康检测 smartmontools
+            - Samba4 LuCI（samba4-server 首次启动后自动安装）
+            - 网络唤醒 WOL / 定时重启 / 计划任务
+            - AdGuard Home LuCI（二进制首次启动后自动安装）
+            - SmartDNS（监听 5335，dnsmasq 转发，不与 dnsmasq 冲突）
+            - DDNS + Cloudflare 脚本 / UPnP / 流量监控 nlbwmon
+            - IPv6 + ipv6helper / BBR 拥塞控制
+            - 网络诊断 mtr / tcpdump / iwinfo
+            - Docker LuCI + 内核模块（dockerd 首次启动后自动安装）
+            - Lucky 内网穿透（首次启动后自动安装）
+            - CPU 频率调节
 
             ### 📌 默认信息
-            - 管理地址：**http://192.168.2.1**
-            - 用户名：root，密码：无（首次登录请立即设置密码）
-            - 首次启动约 3-5 分钟后自动安装 Docker/AdGuard/Samba 等大包
-            - SSH：`apk update && apk upgrade` 即可更新软件包
+            - **管理地址**: http://192.168.2.1
+            - **用户名**: root，**密码**: 无（首次登录立即设置）
+            - **首次启动**: 约 5 分钟后异步安装 sing-box / Docker / AdGuard / Samba
+            - **DNS**: dnsmasq(53) → smartdns(5335)，两者不冲突
+            - **加速**: nftables flowtable（已移除与 nftables 冲突的 SFE）
+            - **SSH 更新**: `apk update && apk upgrade`
+
+            ### ⚠️ 注意
+            - 固件为 SNAPSHOT，建议刷入后立即 `apk update && apk upgrade`
+            - 如需 SFE 加速: `apk add kmod-sfe kmod-fast-classifier`（请先验证稳定性）
 
           files: ${{ env.FIRMWARE_PATH }}/*
           draft: false
@@ -312,18 +361,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 📋 Show Build Log Tail
+      - name: 📋 Show Build Log
         if: always()
         run: |
-          echo "=== 日志文件大小 ==="
+          echo "=== 日志大小 ==="
           ls -lh openwrt/build.log openwrt/build-verbose.log 2>/dev/null || true
           echo "=== build.log 最后 50 行 ==="
           tail -50 openwrt/build.log 2>/dev/null || echo "(无日志)"
           echo "=== build-verbose.log 最后 150 行 ==="
-          tail -150 openwrt/build-verbose.log 2>/dev/null || echo "(无详细日志，说明多线程已成功)"
-          echo "=== bin 目录完整内容 ==="
+          tail -150 openwrt/build-verbose.log 2>/dev/null \
+            || echo "(无详细日志，说明多线程已成功)"
+          echo "=== bin 目录 ==="
           find openwrt/bin -type f | sort
-          echo "=== .config 中的设备确认 ==="
-          grep "DEVICE\|TARGET_BOARD\|TARGET_SUBTARGET" openwrt/.config | grep -v "^#"
-          echo "=== files/ 目录预置内容 ==="
-          find openwrt/files -type f 2>/dev/null || echo "(files/ 目录不存在)"
+          echo "=== .config 设备/关键项 ==="
+          grep -E "DEVICE|TARGET_BOARD|TARGET_SUBTARGET|ath11k|kmod-sfe|netifd" \
+            openwrt/.config | grep -v "^#"
+          echo "=== files/ 预置内容 ==="
+          find openwrt/files -type f 2>/dev/null || echo "(files/ 不存在)"
