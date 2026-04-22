@@ -21,12 +21,12 @@ touch "$LOCK"
 
 log "▶ install-extras 开始"
 
-# 清理 video feed
+# ── 清理 video feed ──────────────────────────────────────────────────
 for f in /etc/apk/repositories.d/*.list; do
     [ -f "$f" ] && sed -i '/\/video\//d' "$f"
 done
 
-# 等待网络
+# ── 等待网络 + DNS 双重就绪 ──────────────────────────────────────────
 sleep 5
 NETWORK_OK=0
 for i in $(seq 1 60); do
@@ -40,61 +40,75 @@ if [ "$NETWORK_OK" -eq 0 ]; then
 fi
 log "✅ 网络就绪"
 
-# ── 关键：修复 apk TLS 后端 ───────────────────────────────────────────
-# apk 默认链接 mbedtls，在部分环境下 HTTPS 握手失败（wget error 4）
-# 解决：先用 HTTP 源安装 apk-openssl，再切回 HTTPS
-fix_apk_tls() {
-    # 如果已经是 openssl 则跳过
-    apk info 2>/dev/null | grep -q "^apk-openssl" && {
-        log "✅ apk-openssl 已安装，跳过修复"
-        return 0
-    }
+# ── 确保 DNS 可用（smartdns 可能还未就绪）────────────────────────────
+DNS_OK=0
+for i in $(seq 1 20); do
+    nslookup downloads.immortalwrt.org 127.0.0.1 >/dev/null 2>&1 && { DNS_OK=1; break; }
+    nslookup downloads.immortalwrt.org 223.5.5.5 >/dev/null 2>&1 && { DNS_OK=1; break; }
+    sleep 3
+done
 
-    log "🔧 修复 apk TLS：切换到 HTTP 源安装 apk-openssl..."
+if [ "$DNS_OK" -eq 0 ]; then
+    log "⚠️  本地 DNS 不可用，临时注入 223.5.5.5"
+    # 临时追加，不破坏原有 resolv.conf 软链
+    echo "nameserver 223.5.5.5" > /tmp/resolv-extras.conf
+    export RESOLV_CONF=/tmp/resolv-extras.conf
+    # OpenWrt wget/apk 读取 /etc/resolv.conf，直接写入临时 nameserver
+    # 注意：这里写的是真实文件，不是软链目标
+    ORIG_RESOLV=$(cat /etc/resolv.conf 2>/dev/null)
+    echo "nameserver 223.5.5.5" >> /etc/resolv.conf
+    DNS_INJECTED=1
+fi
 
-    # 临时切换到 HTTP
+# ── 修复 apk TLS 并验证 apk update ──────────────────────────────────
+fix_apk_and_update() {
+    # 先尝试 HTTPS
+    if apk update 2>&1 | tee /tmp/apk-update.log | logger -t "$LOG_TAG"; then
+        if ! grep -q "unavailable" /tmp/apk-update.log; then
+            log "✅ apk update (HTTPS) 成功"
+            return 0
+        fi
+    fi
+
+    log "⚠️  HTTPS apk update 失败，切换到 HTTP..."
     for f in /etc/apk/repositories.d/*.list; do
-        [ -f "$f" ] && sed -i 's|https://downloads.immortalwrt.org|http://downloads.immortalwrt.org|g' "$f"
+        [ -f "$f" ] && sed -i \
+            's|https://downloads.immortalwrt.org|http://downloads.immortalwrt.org|g' "$f"
     done
 
-    apk update 2>&1 | logger -t "$LOG_TAG"
-
-    # 切换 apk TLS 后端
-    # 必须先修改 world，再 apk fix（不能直接 apk add，会产生冲突）
-    WORLD="/etc/apk/world"
-    if grep -q "^apk-mbedtls$" "$WORLD" 2>/dev/null; then
-        sed -i 's/^apk-mbedtls$/apk-openssl/' "$WORLD"
+    if apk update 2>&1 | tee /tmp/apk-update.log | logger -t "$LOG_TAG"; then
+        if ! grep -q "unavailable" /tmp/apk-update.log; then
+            log "✅ apk update (HTTP) 成功"
+            # 同步切换 apk TLS 后端到 openssl（HTTP 下可以正常安装）
+            WORLD="/etc/apk/world"
+            if grep -q "^apk-mbedtls$" "$WORLD" 2>/dev/null; then
+                sed -i 's/^apk-mbedtls$/apk-openssl/' "$WORLD"
+                apk fix 2>&1 | logger -t "$LOG_TAG" || true
+            fi
+            return 0
+        fi
     fi
-    apk fix 2>&1 | logger -t "$LOG_TAG" \
-        && log "✅ apk-openssl 安装完成" \
-        || { log "⚠️  apk fix 失败，尝试直接安装..."; \
-             apk add --no-cache apk-openssl 2>&1 | logger -t "$LOG_TAG"; }
 
-    # 切回 HTTPS
-    for f in /etc/apk/repositories.d/*.list; do
-        [ -f "$f" ] && sed -i 's|http://downloads.immortalwrt.org|https://downloads.immortalwrt.org|g' "$f"
-    done
-
-    # 用新的 apk-openssl 验证 HTTPS 是否正常
-    apk update 2>&1 | logger -t "$LOG_TAG"
-    if apk update 2>/dev/null | grep -q "unavailable"; then
-        log "⚠️  HTTPS 仍有错误，保持 HTTP 源"
-        for f in /etc/apk/repositories.d/*.list; do
-            [ -f "$f" ] && sed -i 's|https://downloads.immortalwrt.org|http://downloads.immortalwrt.org|g' "$f"
-        done
-        apk update 2>&1 | logger -t "$LOG_TAG"
-    else
-        log "✅ HTTPS 已正常"
-    fi
+    log "❌ apk update 彻底失败"
+    return 1
 }
 
-fix_apk_tls
+if ! fix_apk_and_update; then
+    log "❌ 无法更新包索引，等下次重试"
+    [ -n "$DNS_INJECTED" ] && /etc/init.d/dnsmasq restart 2>/dev/null || true
+    rm -f "$LOCK"; exit 1
+fi
 
+# ── 安装函数：失败时记录但继续，最终统计 ────────────────────────────
+INSTALL_FAIL=0
 install_pkg() {
     log "📦 安装: $*"
-    apk add --no-cache "$@" 2>&1 | logger -t "$LOG_TAG" \
-        && log "✅ 完成: $*" \
-        || log "⚠️  失败: $*（可手动: apk add $*）"
+    if apk add --no-cache "$@" 2>&1 | logger -t "$LOG_TAG"; then
+        log "✅ 完成: $*"
+    else
+        log "⚠️  失败: $*（可手动: apk add $*）"
+        INSTALL_FAIL=$((INSTALL_FAIL + 1))
+    fi
 }
 
 install_pkg adguardhome luci-app-adguardhome luci-i18n-adguardhome-zh-cn
@@ -106,7 +120,7 @@ install_pkg luci-app-fileassistant
 install_pkg luci-app-crontabs luci-i18n-crontabs-zh-cn
 install_pkg smartmontools lsblk fdisk bash htop
 
-# 配置并启动 Docker
+# ── 配置并启动 Docker ────────────────────────────────────────────────
 if command -v dockerd >/dev/null 2>&1; then
     mkdir -p /etc/docker
     USB_MOUNT=""
@@ -126,17 +140,39 @@ if command -v dockerd >/dev/null 2>&1; then
     /etc/init.d/dockerd start  2>/dev/null || true
 fi
 
+# ── 恢复 DNS，刷新 LuCI ──────────────────────────────────────────────
+[ -n "$DNS_INJECTED" ] && /etc/init.d/dnsmasq restart 2>/dev/null || true
 rm -f /tmp/luci-indexcache* 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null || true
 
+# ── 清理 hotplug 触发器 ──────────────────────────────────────────────
 rm -f /etc/hotplug.d/iface/99-install-extras
 rm -f "$LOCK"
-touch "$DONE_FLAG"
-log "🎉 install-extras 全部完成"
+
+# ── 只有全部成功才写 DONE_FLAG ───────────────────────────────────────
+if [ "$INSTALL_FAIL" -eq 0 ]; then
+    touch "$DONE_FLAG"
+    log "🎉 install-extras 全部完成"
+else
+    log "⚠️  有 $INSTALL_FAIL 组包失败，未写 DONE_FLAG，下次 WAN UP 将重试"
+    # 重新安装 hotplug 触发器以便重试
+    mkdir -p /etc/hotplug.d/iface
+    cat > /etc/hotplug.d/iface/99-install-extras << 'HOTPLUGEOF'
+#!/bin/sh
+[ "$ACTION" = "ifup" ] || exit 0
+[ -f /etc/install-extras-done ] && exit 0
+case "$INTERFACE" in
+    wan|wan6|pppoe-wan) ;;
+    *) exit 0 ;;
+esac
+/usr/lib/install-extras/run.sh &
+HOTPLUGEOF
+    chmod +x /etc/hotplug.d/iface/99-install-extras
+fi
 RUNEOF
 chmod +x /usr/lib/install-extras/run.sh
 
-# hotplug 触发器
+# ── 安装 hotplug 触发器 ──────────────────────────────────────────────
 mkdir -p /etc/hotplug.d/iface
 cat > /etc/hotplug.d/iface/99-install-extras << 'HOTPLUGEOF'
 #!/bin/sh
