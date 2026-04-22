@@ -26,8 +26,8 @@ for f in /etc/apk/repositories.d/*.list; do
     [ -f "$f" ] && sed -i '/\/video\//d' "$f"
 done
 
-# ── 等待网络 + DNS 双重就绪 ──────────────────────────────────────────
-sleep 5
+# ── 等待 IP 连通性 ───────────────────────────────────────────────────
+sleep 10
 NETWORK_OK=0
 for i in $(seq 1 60); do
     ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && { NETWORK_OK=1; break; }
@@ -40,66 +40,56 @@ if [ "$NETWORK_OK" -eq 0 ]; then
 fi
 log "✅ 网络就绪"
 
-# ── 确保 DNS 可用（smartdns 可能还未就绪）────────────────────────────
+# ── 强制写入可用 DNS，绕过 smartdns/dnsmasq 链路 ─────────────────────
+# apk 内部用 wget，wget 读 /etc/resolv.conf
+# dnsmasq 转发到 smartdns:5335，但 smartdns 启动时序不确定
+# 直接写公共 DNS 确保 apk 能解析，不影响 LAN 客户端（那走 dnsmasq）
+RESOLV_CONF="/etc/resolv.conf"
+RESOLV_BACKUP="/tmp/resolv.conf.extras-backup"
+cp -f "$RESOLV_CONF" "$RESOLV_BACKUP" 2>/dev/null || true
+printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > "$RESOLV_CONF"
+log "✅ DNS 临时注入：223.5.5.5 / 8.8.8.8"
+
+# ── 验证 DNS 解析 ────────────────────────────────────────────────────
 DNS_OK=0
-for i in $(seq 1 20); do
-    nslookup downloads.immortalwrt.org 127.0.0.1 >/dev/null 2>&1 && { DNS_OK=1; break; }
+for i in $(seq 1 10); do
     nslookup downloads.immortalwrt.org 223.5.5.5 >/dev/null 2>&1 && { DNS_OK=1; break; }
-    sleep 3
+    sleep 2
 done
-
 if [ "$DNS_OK" -eq 0 ]; then
-    log "⚠️  本地 DNS 不可用，临时注入 223.5.5.5"
-    # 临时追加，不破坏原有 resolv.conf 软链
-    echo "nameserver 223.5.5.5" > /tmp/resolv-extras.conf
-    export RESOLV_CONF=/tmp/resolv-extras.conf
-    # OpenWrt wget/apk 读取 /etc/resolv.conf，直接写入临时 nameserver
-    # 注意：这里写的是真实文件，不是软链目标
-    ORIG_RESOLV=$(cat /etc/resolv.conf 2>/dev/null)
-    echo "nameserver 223.5.5.5" >> /etc/resolv.conf
-    DNS_INJECTED=1
+    log "❌ DNS 解析失败，等下次重试"
+    cp -f "$RESOLV_BACKUP" "$RESOLV_CONF" 2>/dev/null || true
+    rm -f "$LOCK"; exit 1
 fi
+log "✅ DNS 解析正常"
 
-# ── 修复 apk TLS 并验证 apk update ──────────────────────────────────
-fix_apk_and_update() {
-    # 先尝试 HTTPS
-    if apk update 2>&1 | tee /tmp/apk-update.log | logger -t "$LOG_TAG"; then
-        if ! grep -q "unavailable" /tmp/apk-update.log; then
-            log "✅ apk update (HTTPS) 成功"
-            return 0
-        fi
-    fi
+# ── apk update，HTTP/HTTPS 自动降级 ──────────────────────────────────
+apk_update_ok() {
+    # 先 HTTPS
+    apk update 2>&1 | logger -t "$LOG_TAG"
+    AVAIL=$(apk update 2>/dev/null | grep -oE '[0-9]+ distinct packages' | grep -oE '^[0-9]+')
+    [ "${AVAIL:-0}" -gt 1000 ] && return 0
 
-    log "⚠️  HTTPS apk update 失败，切换到 HTTP..."
+    log "⚠️  HTTPS 包数不足（${AVAIL:-0}），切换 HTTP..."
     for f in /etc/apk/repositories.d/*.list; do
         [ -f "$f" ] && sed -i \
             's|https://downloads.immortalwrt.org|http://downloads.immortalwrt.org|g' "$f"
     done
+    apk update 2>&1 | logger -t "$LOG_TAG"
+    AVAIL=$(apk update 2>/dev/null | grep -oE '[0-9]+ distinct packages' | grep -oE '^[0-9]+')
+    [ "${AVAIL:-0}" -gt 1000 ] && return 0
 
-    if apk update 2>&1 | tee /tmp/apk-update.log | logger -t "$LOG_TAG"; then
-        if ! grep -q "unavailable" /tmp/apk-update.log; then
-            log "✅ apk update (HTTP) 成功"
-            # 同步切换 apk TLS 后端到 openssl（HTTP 下可以正常安装）
-            WORLD="/etc/apk/world"
-            if grep -q "^apk-mbedtls$" "$WORLD" 2>/dev/null; then
-                sed -i 's/^apk-mbedtls$/apk-openssl/' "$WORLD"
-                apk fix 2>&1 | logger -t "$LOG_TAG" || true
-            fi
-            return 0
-        fi
-    fi
-
-    log "❌ apk update 彻底失败"
     return 1
 }
 
-if ! fix_apk_and_update; then
-    log "❌ 无法更新包索引，等下次重试"
-    [ -n "$DNS_INJECTED" ] && /etc/init.d/dnsmasq restart 2>/dev/null || true
+if ! apk_update_ok; then
+    log "❌ apk update 失败（包数不足），等下次重试"
+    cp -f "$RESOLV_BACKUP" "$RESOLV_CONF" 2>/dev/null || true
     rm -f "$LOCK"; exit 1
 fi
+log "✅ apk update 成功，可用包：${AVAIL}"
 
-# ── 安装函数：失败时记录但继续，最终统计 ────────────────────────────
+# ── 安装函数 ─────────────────────────────────────────────────────────
 INSTALL_FAIL=0
 install_pkg() {
     log "📦 安装: $*"
@@ -140,8 +130,12 @@ if command -v dockerd >/dev/null 2>&1; then
     /etc/init.d/dockerd start  2>/dev/null || true
 fi
 
-# ── 恢复 DNS，刷新 LuCI ──────────────────────────────────────────────
-[ -n "$DNS_INJECTED" ] && /etc/init.d/dnsmasq restart 2>/dev/null || true
+# ── 恢复 DNS（交还给 dnsmasq/smartdns 管理）─────────────────────────
+cp -f "$RESOLV_BACKUP" "$RESOLV_CONF" 2>/dev/null || \
+    printf 'nameserver 127.0.0.1\n' > "$RESOLV_CONF"
+log "✅ DNS 已恢复"
+
+# ── 刷新 LuCI ────────────────────────────────────────────────────────
 rm -f /tmp/luci-indexcache* 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null || true
 
@@ -149,13 +143,13 @@ rm -f /tmp/luci-indexcache* 2>/dev/null
 rm -f /etc/hotplug.d/iface/99-install-extras
 rm -f "$LOCK"
 
-# ── 只有全部成功才写 DONE_FLAG ───────────────────────────────────────
+# ── 写 DONE_FLAG（失败时不写，等重试）───────────────────────────────
 if [ "$INSTALL_FAIL" -eq 0 ]; then
     touch "$DONE_FLAG"
     log "🎉 install-extras 全部完成"
 else
-    log "⚠️  有 $INSTALL_FAIL 组包失败，未写 DONE_FLAG，下次 WAN UP 将重试"
-    # 重新安装 hotplug 触发器以便重试
+    log "⚠️  有 $INSTALL_FAIL 组包失败，下次 WAN UP 重试"
+    # 重装 hotplug 触发器
     mkdir -p /etc/hotplug.d/iface
     cat > /etc/hotplug.d/iface/99-install-extras << 'HOTPLUGEOF'
 #!/bin/sh
