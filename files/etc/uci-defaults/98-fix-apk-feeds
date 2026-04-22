@@ -1,25 +1,23 @@
 #!/bin/sh
 # 98-fix-apk-feeds
-# 执行两件事（无需网络，立即运行）：
-# 1. 清理 apk video feed（导致 update 报错 404）
-# 2. 确保 /etc/apk/world 中是 apk-openssl 而非 apk-mbedtls
-#    （apk 二进制链接的 TLS 后端决定 HTTPS 是否可用）
+# 在 uci-defaults 阶段（有网络之前）完成以下操作：
+#   1. 清理 video feed
+#   2. 把 apk world 中 apk-mbedtls 替换为 apk-openssl
+#
+# apk-openssl 的实际安装（需要网络）交给 96-install-extras 的 hotplug 触发器
+# 此处只做 world 文件修改，确保下次 apk fix/update 时使用正确的 TLS 后端
 
 # ── 1. 清理 video feed ─────────────────────────────────────────────────
-REPO_LIST_DIR="/etc/apk/repositories.d"
-for f in "$REPO_LIST_DIR"/*.list; do
-    [ -f "$f" ] || continue
-    sed -i '/\/video\//d' "$f"
+for f in /etc/apk/repositories.d/*.list; do
+    [ -f "$f" ] && sed -i '/\/video\//d' "$f"
 done
-logger -t "98-fix-apk-feeds" "✅ video feed 已清理"
 
-# ── 2. 确保 apk world 使用 apk-openssl ────────────────────────────────
-# 如果固件已经用 apk-openssl 编译，world 里会是 apk-openssl，此步骤无操作
-# 如果因某种原因还是 apk-mbedtls，则修正（兜底保险）
+# ── 2. world 文件：apk-mbedtls → apk-openssl ──────────────────────────
 WORLD="/etc/apk/world"
 if [ -f "$WORLD" ] && grep -q "^apk-mbedtls$" "$WORLD"; then
     sed -i 's/^apk-mbedtls$/apk-openssl/' "$WORLD"
-    logger -t "98-fix-apk-feeds" "✅ apk world 已从 apk-mbedtls 迁移到 apk-openssl"
+    logger -t "98-fix-apk-feeds" "✅ apk world: apk-mbedtls → apk-openssl"
 fi
 
+logger -t "98-fix-apk-feeds" "✅ feeds 修复完成"
 exit 0
