@@ -1,85 +1,95 @@
 #!/bin/sh
 # 96-install-extras
-# 在 uci-defaults 阶段写入一个 procd init 服务。
-# 该服务在系统第二次启动（uci-defaults 执行完重启后）的 START=99 时触发，
-# 后台异步安装所有移出固件的软件包。
+# hotplug iface 触发：WAN UP 后自动安装软件包
 
 DONE_FLAG="/etc/install-extras-done"
 [ -f "$DONE_FLAG" ] && exit 0
 
-# ── 写入 init 服务 ──────────────────────────────────────────────────────
-# 使用 USE_PROCD=1 + procd_open_instance 正确写法
-# 不使用 start-stop-daemon（OpenWrt busybox 参数支持不完整）
-# respawn 完全不填，procd 默认行为是启动一次
 mkdir -p /usr/lib/install-extras
 
-cat > /etc/init.d/install-extras << 'INIT_EOF'
-#!/bin/sh /etc/rc.common
-START=99
-USE_PROCD=1
-
-start_service() {
-    [ -f /etc/install-extras-done ] && return 0
-    procd_open_instance "install-extras"
-    procd_set_param command /bin/sh /usr/lib/install-extras/run.sh
-    procd_set_param stdout 1
-    procd_set_param stderr 1
-    # 不设 respawn：执行一次即可，不需要守护
-    procd_close_instance
-}
-
-service_triggers() {
-    procd_add_reload_trigger "network"
-}
-INIT_EOF
-chmod +x /etc/init.d/install-extras
-
-# ── 写入安装脚本 ────────────────────────────────────────────────────────
-cat > /usr/lib/install-extras/run.sh << 'RUN_EOF'
+cat > /usr/lib/install-extras/run.sh << 'RUNEOF'
 #!/bin/sh
 LOG_TAG="install-extras"
 DONE_FLAG="/etc/install-extras-done"
+LOCK="/tmp/install-extras.lock"
 
 log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
 
-# 幂等
 [ -f "$DONE_FLAG" ] && exit 0
+[ -f "$LOCK" ] && exit 0
+touch "$LOCK"
 
-log "⏳ 等待系统完全启动 (60s)..."
-sleep 60
+log "▶ install-extras 开始"
 
-# 修复 apk video feed（导致 update 报错）
+# 清理 video feed
 for f in /etc/apk/repositories.d/*.list; do
     [ -f "$f" ] && sed -i '/\/video\//d' "$f"
 done
-log "✅ apk video feed 已清理"
 
-# 等待 WAN 网络（最多 8 分钟）
-log "⏳ 等待网络..."
+# 等待网络
+sleep 5
 NETWORK_OK=0
-for i in $(seq 1 240); do
+for i in $(seq 1 60); do
     ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && { NETWORK_OK=1; break; }
     ping -c 1 -W 2 8.8.8.8  >/dev/null 2>&1 && { NETWORK_OK=1; break; }
-    sleep 2
+    sleep 3
 done
-
 if [ "$NETWORK_OK" -eq 0 ]; then
-    log "❌ 网络超时，下次启动自动重试（未写 DONE_FLAG）"
-    # 保持 enable 状态，下次启动继续尝试
-    exit 1
+    log "❌ 网络不可达，等下次 WAN UP 重试"
+    rm -f "$LOCK"; exit 1
 fi
-log "✅ 网络就绪（第 ${i} 次探测）"
+log "✅ 网络就绪"
 
-# apk update（失败时重试一次）
-log "📦 apk update..."
-apk update 2>&1 | logger -t "$LOG_TAG"
-if [ $? -ne 0 ]; then
-    log "⚠️  apk update 失败，10s 后重试..."
-    sleep 10
+# ── 关键：修复 apk TLS 后端 ───────────────────────────────────────────
+# apk 默认链接 mbedtls，在部分环境下 HTTPS 握手失败（wget error 4）
+# 解决：先用 HTTP 源安装 apk-openssl，再切回 HTTPS
+fix_apk_tls() {
+    # 如果已经是 openssl 则跳过
+    apk info 2>/dev/null | grep -q "^apk-openssl" && {
+        log "✅ apk-openssl 已安装，跳过修复"
+        return 0
+    }
+
+    log "🔧 修复 apk TLS：切换到 HTTP 源安装 apk-openssl..."
+
+    # 临时切换到 HTTP
+    for f in /etc/apk/repositories.d/*.list; do
+        [ -f "$f" ] && sed -i 's|https://downloads.immortalwrt.org|http://downloads.immortalwrt.org|g' "$f"
+    done
+
     apk update 2>&1 | logger -t "$LOG_TAG"
-fi
 
-# ── 安装列表（每行一个或多个包名，空行跳过）──────────────────────────
+    # 切换 apk TLS 后端
+    # 必须先修改 world，再 apk fix（不能直接 apk add，会产生冲突）
+    WORLD="/etc/apk/world"
+    if grep -q "^apk-mbedtls$" "$WORLD" 2>/dev/null; then
+        sed -i 's/^apk-mbedtls$/apk-openssl/' "$WORLD"
+    fi
+    apk fix 2>&1 | logger -t "$LOG_TAG" \
+        && log "✅ apk-openssl 安装完成" \
+        || { log "⚠️  apk fix 失败，尝试直接安装..."; \
+             apk add --no-cache apk-openssl 2>&1 | logger -t "$LOG_TAG"; }
+
+    # 切回 HTTPS
+    for f in /etc/apk/repositories.d/*.list; do
+        [ -f "$f" ] && sed -i 's|http://downloads.immortalwrt.org|https://downloads.immortalwrt.org|g' "$f"
+    done
+
+    # 用新的 apk-openssl 验证 HTTPS 是否正常
+    apk update 2>&1 | logger -t "$LOG_TAG"
+    if apk update 2>/dev/null | grep -q "unavailable"; then
+        log "⚠️  HTTPS 仍有错误，保持 HTTP 源"
+        for f in /etc/apk/repositories.d/*.list; do
+            [ -f "$f" ] && sed -i 's|https://downloads.immortalwrt.org|http://downloads.immortalwrt.org|g' "$f"
+        done
+        apk update 2>&1 | logger -t "$LOG_TAG"
+    else
+        log "✅ HTTPS 已正常"
+    fi
+}
+
+fix_apk_tls
+
 install_pkg() {
     log "📦 安装: $*"
     apk add --no-cache "$@" 2>&1 | logger -t "$LOG_TAG" \
@@ -87,67 +97,58 @@ install_pkg() {
         || log "⚠️  失败: $*（可手动: apk add $*）"
 }
 
-install_pkg sing-box
-install_pkg luci-app-homeproxy luci-i18n-homeproxy-zh-cn
-install_pkg dockerd docker docker-compose cgroupfs-mount
-install_pkg luci-app-dockerman luci-i18n-dockerman-zh-cn
 install_pkg adguardhome luci-app-adguardhome luci-i18n-adguardhome-zh-cn
 install_pkg samba4-server luci-app-samba4 luci-i18n-samba4-zh-cn
+install_pkg dockerd docker docker-compose cgroupfs-mount
+install_pkg luci-app-dockerman luci-i18n-dockerman-zh-cn
 install_pkg lucky luci-app-lucky luci-i18n-lucky-zh-cn
 install_pkg luci-app-fileassistant
 install_pkg luci-app-crontabs luci-i18n-crontabs-zh-cn
-install_pkg smartmontools lsblk fdisk
-install_pkg bash htop tcpdump mtr
+install_pkg smartmontools lsblk fdisk bash htop
 
-# ── sing-box 安装后重启 homeproxy ─────────────────────────────────────
-if command -v sing-box >/dev/null 2>&1; then
-    /etc/init.d/homeproxy restart 2>/dev/null || true
-    log "✅ homeproxy 已重启"
-fi
-
-# ── 配置并启动 Docker ──────────────────────────────────────────────────
+# 配置并启动 Docker
 if command -v dockerd >/dev/null 2>&1; then
     mkdir -p /etc/docker
     USB_MOUNT=""
     for mp in /mnt/sda1 /mnt/sda /mnt/usb /mnt/mmcblk0p1; do
         mountpoint -q "$mp" 2>/dev/null && { USB_MOUNT="$mp"; break; }
     done
-
     if [ -n "$USB_MOUNT" ]; then
-        DOCKER_DIR="$USB_MOUNT/docker-data"
-        mkdir -p "$DOCKER_DIR"
-        printf '{\n  "data-root": "%s",\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' \
-            "$DOCKER_DIR" > /etc/docker/daemon.json
-        log "✅ Docker 数据: $DOCKER_DIR (USB)"
+        mkdir -p "$USB_MOUNT/docker-data"
+        printf '{\n  "data-root": "%s/docker-data",\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' \
+            "$USB_MOUNT" > /etc/docker/daemon.json
     else
         printf '{\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "5m", "max-file": "2"}\n}\n' \
             > /etc/docker/daemon.json
-        log "⚠️  Docker 使用 overlay（建议插 USB）"
     fi
-
-    mountpoint -q /sys/fs/cgroup || \
-        mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+    mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
     /etc/init.d/dockerd enable 2>/dev/null || true
     /etc/init.d/dockerd start  2>/dev/null || true
-    sleep 3
-    /etc/init.d/dockerd status 2>/dev/null | grep -q running \
-        && log "✅ dockerd 已启动" \
-        || log "⚠️  dockerd 未运行，手动: /etc/init.d/dockerd start"
 fi
 
-# ── 刷新 LuCI ─────────────────────────────────────────────────────────
 rm -f /tmp/luci-indexcache* 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null || true
 
-# ── 完成，禁用自身 ─────────────────────────────────────────────────────
+rm -f /etc/hotplug.d/iface/99-install-extras
+rm -f "$LOCK"
 touch "$DONE_FLAG"
-/etc/init.d/install-extras disable 2>/dev/null || true
 log "🎉 install-extras 全部完成"
-RUN_EOF
+RUNEOF
 chmod +x /usr/lib/install-extras/run.sh
 
-# ── 启用服务（重启后生效）──────────────────────────────────────────────
-/etc/init.d/install-extras enable
+# hotplug 触发器
+mkdir -p /etc/hotplug.d/iface
+cat > /etc/hotplug.d/iface/99-install-extras << 'HOTPLUGEOF'
+#!/bin/sh
+[ "$ACTION" = "ifup" ] || exit 0
+[ -f /etc/install-extras-done ] && exit 0
+case "$INTERFACE" in
+    wan|wan6|pppoe-wan) ;;
+    *) exit 0 ;;
+esac
+/usr/lib/install-extras/run.sh &
+HOTPLUGEOF
+chmod +x /etc/hotplug.d/iface/99-install-extras
 
-logger -t "96-install-extras" "✅ install-extras 服务已注册，重启后将在 START=99 自动运行"
+logger -t "96-install-extras" "✅ hotplug 触发器已安装"
 exit 0
