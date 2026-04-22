@@ -8,7 +8,6 @@ uci set network.lan.netmask='255.255.255.0'
 uci commit network
 
 # ── FIX-R1: 确保 WAN 口为 DHCP 客户端模式 ───────────────────────────
-# 默认 WAN 应该已经是 dhcp，但刷机过程中可能被覆盖为 none 或 static
 WAN_PROTO=$(uci get network.wan.proto 2>/dev/null)
 if [ "$WAN_PROTO" != "dhcp" ]; then
     uci set network.wan.proto='dhcp'
@@ -16,25 +15,32 @@ if [ "$WAN_PROTO" != "dhcp" ]; then
     logger -t "99-custom-ip" "WAN proto 已修正为 dhcp（原值: ${WAN_PROTO:-未设置}）"
 fi
 
-# ── FIX-R2: 配置 smartdns 监听 5335，dnsmasq 转发到 5335 ─────────────
-# smartdns 默认监听 53，会与 dnsmasq-full 冲突导致 DNS 失效
-# 解决：smartdns 改监听 5335，dnsmasq 作为 DHCP 服务器并转发 DNS 到 5335
-
-# 设置 smartdns 端口为 5335（不监听 53）
+# ── FIX-R2: 配置 smartdns ─────────────────────────────────────────────
+# smartdns uci 配置：port 和 bind_device 是独立字段
+# 不要用 bind='127.0.0.1:5335'，这会损坏配置导致 "active with no instances"
 uci set smartdns.@smartdns[0].port='5335'
-# 不绑定 53 端口，避免与 dnsmasq 冲突
-uci set smartdns.@smartdns[0].bind='127.0.0.1:5335'
-uci commit smartdns 2>/dev/null || true
+uci set smartdns.@smartdns[0].ipv6_server='0'
+# 确保 bind 字段不残留错误值
+uci delete smartdns.@smartdns[0].bind 2>/dev/null || true
+uci commit smartdns
 
-# 配置 dnsmasq-full 转发 DNS 到本地 smartdns:5335
-# 清除旧的转发配置，重新设置
+# ── FIX-R3: 配置 dnsmasq 转发到 smartdns:5335 ────────────────────────
 uci delete dhcp.@dnsmasq[0].server 2>/dev/null || true
 uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#5335'
-# 确保 dnsmasq 不自行解析（全部转发给 smartdns）
 uci set dhcp.@dnsmasq[0].noresolv='1'
-# 确保 dnsmasq 监听 LAN 接口的 53 端口（DHCP+DNS 一体）
 uci set dhcp.@dnsmasq[0].localuse='1'
+# 提高并发查询上限，避免 "Maximum number of concurrent DNS queries reached"
+uci set dhcp.@dnsmasq[0].dnsforwardmax='1000'
 uci commit dhcp
 
-logger -t "99-custom-ip" "LAN=192.168.2.1 WAN=dhcp smartdns=127.0.0.1:5335 dnsmasq->5335 配置完成"
+# ── FIX-R4: 确保 smartdns 开机自启 ──────────────────────────────────
+/etc/init.d/smartdns enable
+
+# ── FIX-R5: 确保 resolv.conf 指向 dnsmasq（防止 netifd 写错）────────
+# netifd 会在 WAN UP 时重写 /tmp/resolv.conf.d/resolv.conf.auto
+# 但本机 dnsmasq 监听 53，/etc/resolv.conf 应指向 127.0.0.1
+# OpenWrt 默认行为正确，这里只做保底
+ln -sf /tmp/resolv.conf /etc/resolv.conf 2>/dev/null || true
+
+logger -t "99-custom-ip" "LAN=192.168.2.1 WAN=dhcp smartdns:5335 dnsmasq->5335 dnsforwardmax=1000 配置完成"
 exit 0
