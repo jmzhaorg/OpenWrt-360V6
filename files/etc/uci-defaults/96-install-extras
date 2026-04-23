@@ -1,5 +1,6 @@
 #!/bin/sh
 # 96-install-extras
+# hotplug iface 触发：WAN UP 后自动安装软件包
 
 DONE_FLAG="/etc/install-extras-done"
 [ -f "$DONE_FLAG" ] && exit 0
@@ -20,10 +21,12 @@ touch "$LOCK"
 
 log "▶ install-extras 开始"
 
+# ── 清理 video feed ──────────────────────────────────────────────────
 for f in /etc/apk/repositories.d/*.list; do
     [ -f "$f" ] && sed -i '/\/video\//d' "$f"
 done
 
+# ── 等待网络 ─────────────────────────────────────────────────────────
 sleep 10
 NETWORK_OK=0
 for i in $(seq 1 60); do
@@ -37,16 +40,15 @@ if [ "$NETWORK_OK" -eq 0 ]; then
 fi
 log "✅ 网络就绪"
 
+# ── 强制写入公共 DNS，绕过 smartdns 时序问题 ─────────────────────────
 printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
 log "✅ DNS 注入：223.5.5.5 / 8.8.8.8"
 
-# ── apk update：直接解析输出的包数，不用 apk info ────────────────────
+# ── apk update ───────────────────────────────────────────────────────
 apk_update_ok() {
-    local out
+    local out n
     out=$(apk update 2>&1)
     echo "$out" | logger -t "$LOG_TAG"
-    # 解析 "OK: 10515 distinct packages available" 中的数字
-    local n
     n=$(echo "$out" | grep -oE 'OK: [0-9]+ distinct' | grep -oE '[0-9]+')
     [ "${n:-0}" -gt 1000 ] && return 0
 
@@ -68,6 +70,7 @@ if ! apk_update_ok; then
 fi
 log "✅ apk update 成功"
 
+# ── 安装函数 ─────────────────────────────────────────────────────────
 INSTALL_FAIL=0
 install_pkg() {
     log "📦 安装: $*"
@@ -79,25 +82,13 @@ install_pkg() {
     fi
 }
 
-install_pkg adguardhome luci-app-adguardhome luci-i18n-adguardhome-zh-Hans
+# docker/dockerman 已编译内置，不在此安装
+# lucky/fileassistant/crontabs 官方源不存在，已移除
+install_pkg adguardhome luci-app-adguardhome
 install_pkg samba4-server luci-app-samba4 luci-i18n-samba4-zh-cn
-
-log "📦 安装: docker docker-compose"
-if apk add --no-cache docker docker-compose 2>&1 | logger -t "$LOG_TAG"; then
-    log "✅ 完成: docker docker-compose"
-    apk add --no-cache dockerd 2>&1 | logger -t "$LOG_TAG" \
-        && log "✅ 完成: dockerd" \
-        || log "⚠️  dockerd kmod 依赖不满足，跳过"
-else
-    log "⚠️  docker 安装失败"
-    INSTALL_FAIL=$((INSTALL_FAIL + 1))
-fi
-
-install_pkg luci-app-dockerman luci-i18n-dockerman-zh-cn
 install_pkg smartmontools bash htop fdisk lsblk
 
-# lucky / fileassistant / crontabs 不在官方源，已移除
-
+# ── 配置 Docker 数据目录 ─────────────────────────────────────────────
 if command -v dockerd >/dev/null 2>&1; then
     mkdir -p /etc/docker
     USB_MOUNT=""
@@ -108,20 +99,25 @@ if command -v dockerd >/dev/null 2>&1; then
         mkdir -p "$USB_MOUNT/docker-data"
         printf '{\n  "data-root": "%s/docker-data",\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' \
             "$USB_MOUNT" > /etc/docker/daemon.json
+        log "✅ Docker 数据目录: $USB_MOUNT/docker-data"
     else
         printf '{\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "5m", "max-file": "2"}\n}\n' \
             > /etc/docker/daemon.json
+        log "⚠️  未检测到 U 盘，Docker 数据存储在内置 Flash"
     fi
     mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
     /etc/init.d/dockerd enable 2>/dev/null || true
     /etc/init.d/dockerd start  2>/dev/null || true
 fi
 
+# ── 刷新 LuCI ────────────────────────────────────────────────────────
 rm -f /tmp/luci-indexcache* 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null || true
+
 rm -f /etc/hotplug.d/iface/99-install-extras
 rm -f "$LOCK"
 
+# ── 写 DONE_FLAG ─────────────────────────────────────────────────────
 if [ "$INSTALL_FAIL" -eq 0 ]; then
     touch "$DONE_FLAG"
     log "🎉 install-extras 全部完成"
@@ -143,6 +139,7 @@ fi
 RUNEOF
 chmod +x /usr/lib/install-extras/run.sh
 
+# ── 安装 hotplug 触发器 ──────────────────────────────────────────────
 mkdir -p /etc/hotplug.d/iface
 cat > /etc/hotplug.d/iface/99-install-extras << 'HOTPLUGEOF'
 #!/bin/sh
