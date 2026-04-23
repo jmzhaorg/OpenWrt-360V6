@@ -73,8 +73,12 @@ log "✅ apk update 成功"
 # ── 安装函数 ─────────────────────────────────────────────────────────
 INSTALL_FAIL=0
 install_pkg() {
+    local out ret
     log "📦 安装: $*"
-    if apk add --no-cache "$@" 2>&1 | logger -t "$LOG_TAG"; then
+    out=$(apk add --no-cache "$@" 2>&1)
+    ret=$?
+    echo "$out" | logger -t "$LOG_TAG"
+    if [ "$ret" -eq 0 ]; then
         log "✅ 完成: $*"
     else
         log "⚠️  失败: $*"
@@ -82,20 +86,21 @@ install_pkg() {
     fi
 }
 
-# docker/dockerman 已编译内置，不在此安装
-# lucky/fileassistant/crontabs 官方源不存在，已移除
+# ── 安装软件包 ───────────────────────────────────────────────────────
 install_pkg adguardhome luci-app-adguardhome
 install_pkg samba4-server luci-app-samba4 luci-i18n-samba4-zh-cn
 install_pkg smartmontools bash htop fdisk lsblk
 
-# docker 二进制（无 kmod 依赖）
-install_pkg docker docker-compose
+# docker 客户端（体积小）
+install_pkg docker
 
 # dockerd 和 dockerman 强制安装，跳过 kmod 版本匹配检查
-# 内核模块已内置在固件中，实际运行没有问题
 log "📦 强制安装: dockerd luci-app-dockerman"
-if apk add --no-cache --force-broken-world dockerd \
-    luci-app-dockerman luci-i18n-dockerman-zh-cn 2>&1 | logger -t "$LOG_TAG"; then
+out=$(apk add --no-cache --force-broken-world \
+    dockerd luci-app-dockerman luci-i18n-dockerman-zh-cn 2>&1)
+ret=$?
+echo "$out" | logger -t "$LOG_TAG"
+if [ "$ret" -eq 0 ]; then
     log "✅ 完成: dockerd luci-app-dockerman"
 else
     log "⚠️  失败: dockerd luci-app-dockerman"
