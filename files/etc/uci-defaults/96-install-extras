@@ -109,42 +109,20 @@ install_pkg samba4-server luci-app-samba4 luci-i18n-samba4-zh-cn
 
 # ── 重型应用：强依赖 U 盘，无盘跳过 ─────────────────────────────────
 if [ -n "$USB_MOUNT" ]; then
-    log "⚙️  U 盘已就绪，安装 AdGuardHome 和 Docker..."
+    log "⚙️  U 盘已就绪，准备安装重型应用..."
 
-    # ── AdGuardHome ──────────────────────────────────────────────────
-    install_pkg adguardhome luci-app-adguardhome
-
-    AGH_USB="$USB_MOUNT/AdGuardHome"
-    mkdir -p "$AGH_USB/data"
-    mkdir -p "$AGH_USB/config"
-
-    /etc/init.d/adguardhome stop 2>/dev/null || true
-
-    # 迁移配置文件
-    if [ -f "/etc/adguardhome/adguardhome.yaml" ]; then
-        cp -a /etc/adguardhome/. "$AGH_USB/config/"
-        log "✅ AdGuardHome 配置已迁移 → $AGH_USB/config/"
+    # ── 对策1：优先开启 Swap，缓解后续安装时的内存压力 ──────────────
+    if [ -f "$USB_MOUNT/swapfile" ]; then
+        swapon "$USB_MOUNT/swapfile" 2>/dev/null && \
+            log "✅ 已开启 U 盘 Swap，缓解内存压力" || \
+            log "⚠️  Swap 开启失败（可能已挂载）"
+    else
+        log "ℹ️  未检测到 $USB_MOUNT/swapfile，如内存紧张可手动创建："
+        log "ℹ️  dd if=/dev/zero of=$USB_MOUNT/swapfile bs=1M count=512 && mkswap $USB_MOUNT/swapfile"
     fi
 
-    # 迁移运行数据
-    if [ -d "/var/lib/adguardhome" ] && [ "$(ls -A /var/lib/adguardhome 2>/dev/null)" ]; then
-        cp -a /var/lib/adguardhome/. "$AGH_USB/data/"
-        log "✅ AdGuardHome 数据已迁移 → $AGH_USB/data/"
-    fi
-
-    uci set adguardhome.config.config_file="$AGH_USB/config/adguardhome.yaml"
-    uci set adguardhome.config.work_dir="$AGH_USB/data"
-    uci commit adguardhome
-    log "✅ AdGuardHome uci 配置已更新"
-
-    /etc/init.d/adguardhome enable 2>/dev/null || true
-    /etc/init.d/adguardhome start  2>/dev/null || true
-    log "✅ AdGuardHome 已启动，完全运行于 U 盘"
-
-    # ── Docker ───────────────────────────────────────────────────────
+    # ── 对策2：Docker 先装，体积最大优先占坑，避免 AGH 装完没空间 ────
     mkdir -p "$USB_MOUNT/docker-data"
-
-    # 安装前写好 daemon.json，防止 dockerd 首次启动写入 Flash
     mkdir -p /etc/docker
     printf '{\n  "data-root": "%s/docker-data",\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' \
         "$USB_MOUNT" > /etc/docker/daemon.json
@@ -159,6 +137,43 @@ if [ -n "$USB_MOUNT" ]; then
     /etc/init.d/dockerd enable 2>/dev/null || true
     /etc/init.d/dockerd start  2>/dev/null || true
     log "✅ Docker 已启动，数据目录 → $USB_MOUNT/docker-data"
+
+    # ── AdGuardHome：Docker 装完后再装，Flash 空间已知可用 ───────────
+    install_pkg adguardhome luci-app-adguardhome
+
+    AGH_USB="$USB_MOUNT/AdGuardHome"
+    mkdir -p "$AGH_USB/data"
+    mkdir -p "$AGH_USB/config"
+
+    /etc/init.d/adguardhome stop 2>/dev/null || true
+
+    # 对策3：优先保留 U 盘已有配置，避免重刷后覆盖旧数据
+    if [ ! -f "$AGH_USB/config/adguardhome.yaml" ] && \
+       [ -f "/etc/adguardhome/adguardhome.yaml" ]; then
+        cp -a /etc/adguardhome/. "$AGH_USB/config/"
+        log "✅ 新环境，初始配置已写入 U 盘 → $AGH_USB/config/"
+    else
+        log "ℹ️  U 盘已存在旧配置，直接复用，不覆盖"
+    fi
+
+    # 运行数据同理，仅新环境才迁移
+    if [ ! "$(ls -A $AGH_USB/data 2>/dev/null)" ] && \
+       [ -d "/var/lib/adguardhome" ] && \
+       [ "$(ls -A /var/lib/adguardhome 2>/dev/null)" ]; then
+        cp -a /var/lib/adguardhome/. "$AGH_USB/data/"
+        log "✅ 新环境，运行数据已迁移 → $AGH_USB/data/"
+    else
+        log "ℹ️  U 盘数据目录已有内容或源目录为空，跳过迁移"
+    fi
+
+    uci set adguardhome.config.config_file="$AGH_USB/config/adguardhome.yaml"
+    uci set adguardhome.config.work_dir="$AGH_USB/data"
+    uci commit adguardhome
+    log "✅ AdGuardHome uci 配置已更新"
+
+    /etc/init.d/adguardhome enable 2>/dev/null || true
+    /etc/init.d/adguardhome start  2>/dev/null || true
+    log "✅ AdGuardHome 已启动，完全运行于 U 盘"
 
 else
     log "ℹ️  无 U 盘，跳过 AdGuardHome 和 Docker 安装"
