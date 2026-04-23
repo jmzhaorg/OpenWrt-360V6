@@ -162,58 +162,26 @@ sysupgrade -n /tmp/openwrt-xxx-sysupgrade.bin
 
 ---
 
-## 🎯 刷完固件后的操作步骤
+🎯 刷完固件后的操作步骤
+第一步：连接路由器
+用网线连接路由器任意 LAN 口，浏览器访问 http://192.168.2.1，用户名 root，密码留空。
 
-### 第一步：连接路由器
+第二步：设置 WAN 口上网
+进入 网络 → 接口 → WAN → 编辑，设置好拨号或 DHCP，确保路由器已连接互联网。
 
-用网线连接路由器任意 **LAN 口**，浏览器访问 `http://192.168.2.1`，用户名 `root`，密码留空。
+第三步：插好 U 盘并确认挂载
+插入 ext4 格式的 U 盘（推荐）。进入 系统 → 挂载点 确认挂载为 /mnt/sda1（或 sda/usb 等）。
 
-### 第二步：设置 WAN 口上网
+💡 建议：在 U 盘根目录创建 Swap 文件以提升稳定性：
+dd if=/dev/zero of=/mnt/sda1/swapfile bs=1M count=512 && mkswap /mnt/sda1/swapfile
 
-进入 **网络 → 接口 → WAN → 编辑**：
+第四步：等待软件包自动安装
+WAN 口上线且 U 盘就绪后，脚本会自动开始工作。
 
-| 上网方式 | 协议选择 | 配置说明 |
-|----------|----------|----------|
-| 光猫拨号 | `DHCP 客户端` | 直接保存 |
-| 路由器拨号 | `PPPoE` | 填入宽带账号和密码 |
-| 固定 IP | `静态地址` | 填入 IP / 网关 / DNS |
-
-保存并应用后，等待 WAN 口获取到 IP 地址。
-
-### 第三步：等待软件包自动安装
-
-WAN 口上线后约 **1～3 分钟**，后台开始自动安装 AdGuard Home、Samba4 等软件包。
-
-```sh
+Bash
 # 实时查看安装进度
 logread -f | grep install-extras
-```
-
-看到 `🎉 install-extras 全部完成` 后刷新 LuCI 页面，新菜单项会出现。
-
-### 第四步：修改 WiFi 密码
-
-进入 **网络 → 无线**，分别编辑 2.4GHz 和 5GHz，在 **无线安全** 标签页设置 WPA2 密码。
-
-### 第五步：配置 HomeProxy（可选）
-
-进入 **服务 → HomeProxy**：
-
-1. **节点管理** → 添加节点或导入订阅链接
-2. **基本设置** → 启用 HomeProxy，选择出站节点
-3. 保存并应用
-
-### 第六步：配置 AdGuard Home（可选）
-
-1. 进入 **服务 → AdGuard Home** → 启用并启动
-2. 浏览器访问 `http://192.168.2.1:3000` 完成初始化向导
-3. 建议将 AdGuard Home 监听端口设为 `5353`，避免与 dnsmasq 冲突
-
-### 第七步：挂载 U 盘（可选）
-
-插入 USB 存储设备后，进入 **系统 → 挂载点** 确认已自动挂载，或通过 **系统 → DiskMan** 查看磁盘状态。Docker 数据目录会自动检测并使用 U 盘存储。
-
----
+看到 🎉 install-extras 全部完成 后刷新 LuCI 页面即可。
 
 ## 📋 常用命令
 
@@ -238,12 +206,14 @@ docker-compose up -d          # 启动 compose 项目（需手动安装）
 
 ---
 
-## ⚠️ 注意事项
+⚠️ 注意事项
+❌ 严禁在无 U 盘时通过 apk add 安装 dockerd 或 adguardhome，这会瞬间耗尽 Flash 空间导致系统崩溃。
 
-- ❌ **不要通过 LuCI 软件包管理界面安装软件**，存在 JSON 解析 bug 容易卡死，请始终使用命令行 `apk add`
-- 💾 Flash 空间有限（约 90MB 可用），建议 Docker 镜像存放于 U 盘
-- 📦 `lucky`、`luci-app-fileassistant`、`luci-app-crontabs` 在 ImmortalWrt 官方源中不存在，无法通过 apk 安装
-- 🔐 固件使用 `apk-openssl` 编译，`apk update` 可正常工作
+💾 存储建议：所有镜像和插件日志建议存放于 U 盘。若 Flash 空间依然不足，建议在挂载点中将 U 盘分区挂载为 /overlay 实现彻底扩容。
+
+❌ LuCI 软件包界面：存在 JSON 解析 bug 容易卡死，请始终使用命令行 apk add 安装新软件。
+
+🔐 固件特性：已集成 apk-openssl，apk update 走 HTTPS 更加安全。
 
 ---
 
