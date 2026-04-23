@@ -1,6 +1,3 @@
-以下是您所需的README内容，已将Markdown格式融合并输出为可直接使用的版本：
-
-```markdown
 # OpenWrt for 360 V6 (Qualcomm IPQ6000)
 
 基于 [ImmortalWrt](https://github.com/immortalwrt/immortalwrt) 构建，针对奇虎 360 路由器 V6 定制编译。
@@ -206,4 +203,3 @@ df -h
 | 构建平台 | GitHub Actions (ubuntu-22.04) |
 | 目标架构 | qualcommax / ipq60xx |
 | 内核版本 | Linux 6.12.x |
-```
