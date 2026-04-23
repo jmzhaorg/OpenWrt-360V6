@@ -155,7 +155,6 @@ WAN 口上线后约 **1～3 分钟**，后台开始自动安装 AdGuard Home、S
 ```sh
 # 实时查看安装进度
 logread -f | grep install-extras
-```
 
 看到 `🎉 install-extras 全部完成` 后刷新 LuCI 页面，新菜单项会出现。
 
