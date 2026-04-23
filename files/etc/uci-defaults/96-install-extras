@@ -40,75 +40,71 @@ if [ "$NETWORK_OK" -eq 0 ]; then
 fi
 log "✅ 网络就绪"
 
-# ── 强制写入可用 DNS，绕过 smartdns/dnsmasq 链路 ─────────────────────
-# apk 内部用 wget，wget 读 /etc/resolv.conf
-# dnsmasq 转发到 smartdns:5335，但 smartdns 启动时序不确定
-# 直接写公共 DNS 确保 apk 能解析，不影响 LAN 客户端（那走 dnsmasq）
-RESOLV_CONF="/etc/resolv.conf"
-RESOLV_BACKUP="/tmp/resolv.conf.extras-backup"
-cp -f "$RESOLV_CONF" "$RESOLV_BACKUP" 2>/dev/null || true
-printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > "$RESOLV_CONF"
-log "✅ DNS 临时注入：223.5.5.5 / 8.8.8.8"
+# ── 强制写入公共 DNS（绕过 smartdns 时序问题）────────────────────────
+# 安装期间全程使用公共 DNS，安装完成后由 netifd 在下次 dnsmasq 重启时恢复
+printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+log "✅ DNS 注入：223.5.5.5 / 8.8.8.8"
 
-# ── 验证 DNS 解析 ────────────────────────────────────────────────────
-DNS_OK=0
-for i in $(seq 1 10); do
-    nslookup downloads.immortalwrt.org 223.5.5.5 >/dev/null 2>&1 && { DNS_OK=1; break; }
-    sleep 2
-done
-if [ "$DNS_OK" -eq 0 ]; then
-    log "❌ DNS 解析失败，等下次重试"
-    cp -f "$RESOLV_BACKUP" "$RESOLV_CONF" 2>/dev/null || true
-    rm -f "$LOCK"; exit 1
-fi
-log "✅ DNS 解析正常"
-
-# ── apk update，HTTP/HTTPS 自动降级 ──────────────────────────────────
+# ── apk update ───────────────────────────────────────────────────────
 apk_update_ok() {
-    # 先 HTTPS
     apk update 2>&1 | logger -t "$LOG_TAG"
-    AVAIL=$(apk update 2>/dev/null | grep -oE '[0-9]+ distinct packages' | grep -oE '^[0-9]+')
+    AVAIL=$(apk info --available 2>/dev/null | wc -l)
     [ "${AVAIL:-0}" -gt 1000 ] && return 0
 
-    log "⚠️  HTTPS 包数不足（${AVAIL:-0}），切换 HTTP..."
+    log "⚠️  HTTPS 包数不足（${AVAIL}），切换 HTTP..."
     for f in /etc/apk/repositories.d/*.list; do
         [ -f "$f" ] && sed -i \
             's|https://downloads.immortalwrt.org|http://downloads.immortalwrt.org|g' "$f"
     done
     apk update 2>&1 | logger -t "$LOG_TAG"
-    AVAIL=$(apk update 2>/dev/null | grep -oE '[0-9]+ distinct packages' | grep -oE '^[0-9]+')
+    AVAIL=$(apk info --available 2>/dev/null | wc -l)
     [ "${AVAIL:-0}" -gt 1000 ] && return 0
-
     return 1
 }
 
 if ! apk_update_ok; then
-    log "❌ apk update 失败（包数不足），等下次重试"
-    cp -f "$RESOLV_BACKUP" "$RESOLV_CONF" 2>/dev/null || true
+    log "❌ apk update 失败，等下次重试"
     rm -f "$LOCK"; exit 1
 fi
 log "✅ apk update 成功，可用包：${AVAIL}"
 
-# ── 安装函数 ─────────────────────────────────────────────────────────
+# ── 安装函数（失败计数，不退出）─────────────────────────────────────
 INSTALL_FAIL=0
 install_pkg() {
     log "📦 安装: $*"
     if apk add --no-cache "$@" 2>&1 | logger -t "$LOG_TAG"; then
         log "✅ 完成: $*"
     else
-        log "⚠️  失败: $*（可手动: apk add $*）"
+        log "⚠️  失败: $*"
         INSTALL_FAIL=$((INSTALL_FAIL + 1))
     fi
 }
 
-install_pkg adguardhome luci-app-adguardhome luci-i18n-adguardhome-zh-cn
+# 仅安装源里确认存在的包，包名以实际 snapshot 为准
+# adguardhome：i18n 包名用 zh-Hans（非 zh-cn）
+install_pkg adguardhome luci-app-adguardhome luci-i18n-adguardhome-zh-Hans
+
+# samba4
 install_pkg samba4-server luci-app-samba4 luci-i18n-samba4-zh-cn
-install_pkg dockerd docker docker-compose cgroupfs-mount
+
+# docker：仅安装二进制，跳过 kmod 依赖（kmod 已内置于固件）
+# cgroupfs-mount 已废弃，不装；kmod-ipt-* 与内核版本绑定，只能用内置的
+log "📦 安装: docker docker-compose（跳过 dockerd kmod 依赖）"
+if apk add --no-cache docker docker-compose 2>&1 | logger -t "$LOG_TAG"; then
+    log "✅ 完成: docker docker-compose"
+    # 单独尝试 dockerd，失败不阻塞
+    apk add --no-cache dockerd 2>&1 | logger -t "$LOG_TAG" \
+        && log "✅ 完成: dockerd" \
+        || log "⚠️  dockerd kmod 依赖不满足，跳过（内核模块已内置，可手动解决）"
+else
+    log "⚠️  docker 安装失败"
+    INSTALL_FAIL=$((INSTALL_FAIL + 1))
+fi
+
 install_pkg luci-app-dockerman luci-i18n-dockerman-zh-cn
-install_pkg lucky luci-app-lucky luci-i18n-lucky-zh-cn
-install_pkg luci-app-fileassistant
-install_pkg luci-app-crontabs luci-i18n-crontabs-zh-cn
-install_pkg smartmontools lsblk fdisk bash htop
+
+# 基础工具
+install_pkg smartmontools bash htop fdisk lsblk
 
 # ── 配置并启动 Docker ────────────────────────────────────────────────
 if command -v dockerd >/dev/null 2>&1; then
@@ -130,26 +126,19 @@ if command -v dockerd >/dev/null 2>&1; then
     /etc/init.d/dockerd start  2>/dev/null || true
 fi
 
-# ── 恢复 DNS（交还给 dnsmasq/smartdns 管理）─────────────────────────
-cp -f "$RESOLV_BACKUP" "$RESOLV_CONF" 2>/dev/null || \
-    printf 'nameserver 127.0.0.1\n' > "$RESOLV_CONF"
-log "✅ DNS 已恢复"
-
 # ── 刷新 LuCI ────────────────────────────────────────────────────────
 rm -f /tmp/luci-indexcache* 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null || true
 
-# ── 清理 hotplug 触发器 ──────────────────────────────────────────────
 rm -f /etc/hotplug.d/iface/99-install-extras
 rm -f "$LOCK"
 
-# ── 写 DONE_FLAG（失败时不写，等重试）───────────────────────────────
+# ── DONE_FLAG：全部成功才写，否则重装触发器等重试 ────────────────────
 if [ "$INSTALL_FAIL" -eq 0 ]; then
     touch "$DONE_FLAG"
     log "🎉 install-extras 全部完成"
 else
     log "⚠️  有 $INSTALL_FAIL 组包失败，下次 WAN UP 重试"
-    # 重装 hotplug 触发器
     mkdir -p /etc/hotplug.d/iface
     cat > /etc/hotplug.d/iface/99-install-extras << 'HOTPLUGEOF'
 #!/bin/sh
