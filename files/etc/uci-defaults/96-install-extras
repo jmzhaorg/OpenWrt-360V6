@@ -1,5 +1,5 @@
 #!/bin/sh
-# 96-install-extras [Final-Best v2]
+# 96-install-extras [Final v3]
 # 适用：128M Flash + 512M RAM（360 V6 / 小米 CR660x 等）
 # 改进：Flash 三档保护 / Swap 自动创建 / I/O 优化 / avahi 修复 / AGH 迁移保护
 
@@ -20,7 +20,7 @@ log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
 [ -f "$LOCK" ]      && exit 0
 touch "$LOCK"
 
-log "▶ Final-Best v2 启动 | 128M Flash 保护模式"
+log "▶ Final v3 启动 | 128M Flash 保护模式"
 
 # ══════════════════════════════════════════════════════════════
 # 1. 清理无效 video 源
@@ -134,7 +134,7 @@ fi
 log "✅ apk update 成功"
 
 # ══════════════════════════════════════════════════════════════
-# 7. 安装辅助函数（带失败计数）
+# 7. 安装辅助函数（带失败计数，正确捕获退出码）
 # ══════════════════════════════════════════════════════════════
 INSTALL_FAIL=0
 install_pkg() {
@@ -142,10 +142,12 @@ install_pkg() {
     log "📦 安装: $*"
     out=$(apk add --no-cache "$@" 2>&1); ret=$?
     echo "$out" | logger -t "$LOG_TAG"
-    [ "$ret" -eq 0 ] && log "✅ 完成: $*" || {
+    if [ "$ret" -eq 0 ]; then
+        log "✅ 完成: $*"
+    else
         log "⚠️  失败: $*"
         INSTALL_FAIL=$((INSTALL_FAIL + 1))
-    }
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -158,7 +160,6 @@ FLASH_USED=$(df /overlay 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
 log "📊 Flash 状态: 已用 ${FLASH_USED:-?}% | 剩余 ${FLASH_FREE:-?}KB"
 
 SKIP_LUCI_OPT=0
-
 if [ "${FLASH_FREE:-99999}" -lt 15000 ]; then
     log "🚨 Flash 剩余 <15MB，全部 LuCI 跳过"
     SKIP_LUCI_OPT=1
@@ -187,7 +188,7 @@ fi
 /etc/init.d/dbus restart 2>/dev/null || true
 sleep 2
 /etc/init.d/avahi-daemon restart 2>/dev/null || true
-log "✅ dbus 已重载，avahi-daemon 已启动"
+log "✅ dbus 已重载，avahi-daemon 已重启"
 
 # ══════════════════════════════════════════════════════════════
 # 11. 重型应用（必须有 U 盘，绝不写 Flash）
@@ -195,7 +196,7 @@ log "✅ dbus 已重载，avahi-daemon 已启动"
 if [ -n "$USB_MOUNT" ]; then
     log "⚙️  U 盘就绪，开始安装重型应用..."
 
-    # ── 11.1 Docker（先装，体积最大，优先确认 Flash 空间）────
+    # ── 11.1 Docker ──────────────────────────────────────────
     mkdir -p "$USB_MOUNT/docker-data" /etc/docker
     cat > /etc/docker/daemon.json << EOF
 {
@@ -206,7 +207,19 @@ if [ -n "$USB_MOUNT" ]; then
 EOF
     log "✅ daemon.json 已写入 | data-root=$USB_MOUNT/docker-data"
 
-    install_pkg docker dockerd
+    install_pkg docker
+
+    # dockerd 单独强制安装，绕过 kmod 版本依赖冲突
+    log "📦 强制安装: dockerd"
+    out=$(apk add --no-cache --force-broken-world dockerd 2>&1)
+    ret=$?
+    echo "$out" | logger -t "$LOG_TAG"
+    if [ "$ret" -eq 0 ]; then
+        log "✅ 完成: dockerd"
+    else
+        log "⚠️  失败: dockerd"
+        INSTALL_FAIL=$((INSTALL_FAIL + 1))
+    fi
 
     if [ "$SKIP_LUCI_OPT" -eq 0 ]; then
         install_pkg luci-app-dockerman luci-i18n-dockerman-zh-cn
@@ -219,9 +232,8 @@ EOF
     /etc/init.d/dockerd start  2>/dev/null || true
     log "✅ Docker 已启动"
 
-    # ── 11.2 AdGuardHome（Docker 装完后装）──────────────────
+    # ── 11.2 AdGuardHome ─────────────────────────────────────
     install_pkg adguardhome
-
     if [ "$SKIP_LUCI_OPT" -eq 0 ]; then
         install_pkg luci-app-adguardhome
     else
@@ -265,10 +277,11 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════
-# 12. 刷新 LuCI 缓存
+# 12. 刷新 LuCI 缓存 & 清理触发器
 # ══════════════════════════════════════════════════════════════
 rm -f /tmp/luci-indexcache* 2>/dev/null || true
 /etc/init.d/rpcd restart 2>/dev/null || true
+rm -f /etc/hotplug.d/iface/99-install-extras
 rm -f "$LOCK"
 
 # ══════════════════════════════════════════════════════════════
@@ -277,7 +290,7 @@ rm -f "$LOCK"
 if [ "$INSTALL_FAIL" -eq 0 ]; then
     FLASH_FINAL=$(df /overlay 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
     touch "$DONE_FLAG"
-    log "🎉 Final-Best v2 部署完成！Flash 使用率: ${FLASH_FINAL:-?}%"
+    log "🎉 Final v3 部署完成！Flash 使用率: ${FLASH_FINAL:-?}%"
     [ "${FLASH_FINAL:-0}" -gt 85 ] && \
         log "⚠️  Flash >85%，建议执行: apk cache clean"
 else
@@ -307,5 +320,5 @@ case "$INTERFACE" in wan|wan6|pppoe-wan) ;; *) exit 0 ;; esac
 HOTEOF
 chmod +x /etc/hotplug.d/iface/99-install-extras
 
-logger -t "install-extras" "✅ Final-Best v2 已安装，等待 WAN UP 触发"
+logger -t "install-extras" "✅ Final v3 已安装，等待 WAN UP 触发"
 exit 0
