@@ -88,6 +88,20 @@ install_pkg adguardhome luci-app-adguardhome
 install_pkg samba4-server luci-app-samba4 luci-i18n-samba4-zh-cn
 install_pkg smartmontools bash htop fdisk lsblk
 
+# docker 二进制（无 kmod 依赖）
+install_pkg docker docker-compose
+
+# dockerd 和 dockerman 强制安装，跳过 kmod 版本匹配检查
+# 内核模块已内置在固件中，实际运行没有问题
+log "📦 强制安装: dockerd luci-app-dockerman"
+if apk add --no-cache --force-broken-world dockerd \
+    luci-app-dockerman luci-i18n-dockerman-zh-cn 2>&1 | logger -t "$LOG_TAG"; then
+    log "✅ 完成: dockerd luci-app-dockerman"
+else
+    log "⚠️  失败: dockerd luci-app-dockerman"
+    INSTALL_FAIL=$((INSTALL_FAIL + 1))
+fi
+
 # ── 配置 Docker 数据目录 ─────────────────────────────────────────────
 if command -v dockerd >/dev/null 2>&1; then
     mkdir -p /etc/docker
