@@ -44,6 +44,21 @@ log "✅ 网络就绪"
 printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
 log "✅ DNS 注入：223.5.5.5 / 8.8.8.8"
 
+# ── 检测 U 盘（等待最多 30 秒）───────────────────────────────────────
+USB_MOUNT=""
+log "⏳ 检测 U 盘挂载..."
+for i in $(seq 1 15); do
+    for mp in /mnt/sda1 /mnt/sda /mnt/usb /mnt/mmcblk0p1; do
+        mountpoint -q "$mp" 2>/dev/null && { USB_MOUNT="$mp"; break 2; }
+    done
+    sleep 2
+done
+if [ -n "$USB_MOUNT" ]; then
+    log "✅ U 盘已挂载: $USB_MOUNT"
+else
+    log "⚠️  未检测到 U 盘，docker 相关将跳过"
+fi
+
 # ── apk update ───────────────────────────────────────────────────────
 apk_update_ok() {
     local out n
@@ -86,47 +101,40 @@ install_pkg() {
     fi
 }
 
-# ── 安装软件包 ───────────────────────────────────────────────────────
+# ── 安装到 Flash 的包（体积小，无 U 盘也装）────────────────────────
 install_pkg adguardhome luci-app-adguardhome
 install_pkg samba4-server luci-app-samba4 luci-i18n-samba4-zh-cn
 install_pkg smartmontools bash htop fdisk lsblk
 
-# docker 客户端（体积小）
-install_pkg docker
-
-# dockerd 和 dockerman 强制安装，跳过 kmod 版本匹配检查
-log "📦 强制安装: dockerd luci-app-dockerman"
-out=$(apk add --no-cache --force-broken-world \
-    dockerd luci-app-dockerman luci-i18n-dockerman-zh-cn 2>&1)
-ret=$?
-echo "$out" | logger -t "$LOG_TAG"
-if [ "$ret" -eq 0 ]; then
-    log "✅ 完成: dockerd luci-app-dockerman"
-else
-    log "⚠️  失败: dockerd luci-app-dockerman"
-    INSTALL_FAIL=$((INSTALL_FAIL + 1))
-fi
-
-# ── 配置 Docker 数据目录 ─────────────────────────────────────────────
-if command -v dockerd >/dev/null 2>&1; then
-    mkdir -p /etc/docker
-    USB_MOUNT=""
-    for mp in /mnt/sda1 /mnt/sda /mnt/usb /mnt/mmcblk0p1; do
-        mountpoint -q "$mp" 2>/dev/null && { USB_MOUNT="$mp"; break; }
-    done
-    if [ -n "$USB_MOUNT" ]; then
-        mkdir -p "$USB_MOUNT/docker-data"
-        printf '{\n  "data-root": "%s/docker-data",\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' \
-            "$USB_MOUNT" > /etc/docker/daemon.json
-        log "✅ Docker 数据目录: $USB_MOUNT/docker-data"
+# ── Docker 全部依赖 U 盘，无 U 盘跳过────────────────────────────────
+if [ -n "$USB_MOUNT" ]; then
+    # docker CLI + dockerd + dockerman 一次性安装，避免 CLI 先占满 Flash
+    log "📦 强制安装: docker dockerd luci-app-dockerman"
+    out=$(apk add --no-cache --force-broken-world \
+        docker dockerd \
+        luci-app-dockerman luci-i18n-dockerman-zh-cn 2>&1)
+    ret=$?
+    echo "$out" | logger -t "$LOG_TAG"
+    if [ "$ret" -eq 0 ]; then
+        log "✅ 完成: docker dockerd luci-app-dockerman"
     else
-        printf '{\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "5m", "max-file": "2"}\n}\n' \
-            > /etc/docker/daemon.json
-        log "⚠️  未检测到 U 盘，Docker 数据存储在内置 Flash"
+        log "⚠️  失败: docker dockerd luci-app-dockerman"
+        INSTALL_FAIL=$((INSTALL_FAIL + 1))
     fi
+
+    # 配置 Docker 数据目录到 U 盘
+    mkdir -p /etc/docker
+    mkdir -p "$USB_MOUNT/docker-data"
+    printf '{\n  "data-root": "%s/docker-data",\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' \
+        "$USB_MOUNT" > /etc/docker/daemon.json
+    log "✅ Docker 数据目录: $USB_MOUNT/docker-data"
+
     mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
     /etc/init.d/dockerd enable 2>/dev/null || true
     /etc/init.d/dockerd start  2>/dev/null || true
+else
+    log "ℹ️  无 U 盘，跳过 docker/dockerd 安装"
+    log "ℹ️  插入 U 盘后执行: rm /etc/install-extras-done && reboot"
 fi
 
 # ── 刷新 LuCI ────────────────────────────────────────────────────────
