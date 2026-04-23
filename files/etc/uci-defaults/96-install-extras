@@ -1,10 +1,6 @@
 #!/bin/sh
-# 96-install-extras (128M 极简融合版)
-# 设计目标：
-# - 不动系统（不自动扩容）
-# - 自动识别 overlay / U盘
-# - 所有重数据外移
-# - 超低占用 / 高稳定
+# 96-install-extras
+# WAN UP 后自动安装软件包，数据外移至 U 盘
 
 DONE_FLAG="/etc/install-extras-done"
 [ -f "$DONE_FLAG" ] && exit 0
@@ -13,7 +9,7 @@ mkdir -p /usr/lib/install-extras
 
 cat > /usr/lib/install-extras/run.sh << 'RUNEOF'
 #!/bin/sh
-LOG_TAG="install-extras-mini"
+LOG_TAG="install-extras"
 DONE_FLAG="/etc/install-extras-done"
 LOCK="/tmp/install-extras.lock"
 
@@ -23,98 +19,190 @@ log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
 [ -f "$LOCK" ] && exit 0
 touch "$LOCK"
 
-log "▶ 极简融合版启动"
+log "▶ install-extras 开始"
 
-# ── 网络检测 ──
-sleep 5
+# ── 等待网络 ─────────────────────────────────────────────────────────
+sleep 10
+NETWORK_OK=0
+for i in $(seq 1 60); do
+    ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && { NETWORK_OK=1; break; }
+    ping -c 1 -W 2 8.8.8.8  >/dev/null 2>&1 && { NETWORK_OK=1; break; }
+    sleep 3
+done
+if [ "$NETWORK_OK" -eq 0 ]; then
+    log "❌ 网络不可达，等下次 WAN UP 重试"
+    rm -f "$LOCK"; exit 1
+fi
+log "✅ 网络就绪"
+
+# ── DNS 修复 ─────────────────────────────────────────────────────────
+printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+log "✅ DNS 注入"
+
+# ── 检测 U 盘（等待最多 30 秒）───────────────────────────────────────
+USB_MOUNT=""
+log "⏳ 检测 U 盘..."
 for i in $(seq 1 15); do
-    ping -c1 -W1 8.8.8.8 >/dev/null 2>&1 && break
+    for mp in /mnt/sda1 /mnt/sda /mnt/usb /mnt/mmcblk0p1; do
+        mountpoint -q "$mp" 2>/dev/null && { USB_MOUNT="$mp"; break 2; }
+    done
     sleep 2
 done
-
-# ── DNS 修复 ──
-echo "nameserver 8.8.8.8" > /etc/resolv.conf
-
-# ── 判断 overlay ──
-if mount | grep -q "on /overlay type overlay"; then
-    OVERLAY=1
-    DATA_ROOT="/overlay"
-    log "✅ overlay 模式"
+if [ -n "$USB_MOUNT" ]; then
+    log "✅ U 盘已挂载: $USB_MOUNT"
 else
-    OVERLAY=0
-    log "ℹ️ 非 overlay 模式"
+    log "⚠️  未检测到 U 盘，重型应用将跳过"
 fi
 
-# ── 检测 U盘（仅 fallback） ──
-USB_MOUNT=""
-for mp in /mnt/sda1 /mnt/sda /mnt/usb; do
-    mountpoint -q "$mp" 2>/dev/null && USB_MOUNT="$mp" && break
-done
+# ── apk update（带 HTTPS→HTTP 降级重试）──────────────────────────────
+apk_update_ok() {
+    local out n
+    out=$(apk update 2>&1)
+    echo "$out" | logger -t "$LOG_TAG"
+    n=$(echo "$out" | grep -oE 'OK: [0-9]+ distinct' | grep -oE '[0-9]+')
+    [ "${n:-0}" -gt 1000 ] && return 0
 
-if [ "$OVERLAY" -eq 0 ] && [ -n "$USB_MOUNT" ]; then
-    DATA_ROOT="$USB_MOUNT"
-    log "📌 使用U盘: $USB_MOUNT"
-fi
-
-if [ -z "$DATA_ROOT" ]; then
-    log "⚠️ 无 overlay 且无U盘，跳过重型应用"
-fi
-
-# ── 更新源 ──
-apk update || {
-    log "❌ apk update失败"
-    rm -f "$LOCK"
-    exit 1
+    log "⚠️  HTTPS 包数不足（${n:-0}），切换 HTTP..."
+    for f in /etc/apk/repositories.d/*.list; do
+        [ -f "$f" ] && sed -i \
+            's|https://downloads.immortalwrt.org|http://downloads.immortalwrt.org|g' "$f"
+    done
+    out=$(apk update 2>&1)
+    echo "$out" | logger -t "$LOG_TAG"
+    n=$(echo "$out" | grep -oE 'OK: [0-9]+ distinct' | grep -oE '[0-9]+')
+    [ "${n:-0}" -gt 1000 ] && return 0
+    return 1
 }
 
-# ── 基础工具 ──
-apk add --no-cache bash htop >/dev/null 2>&1 && log "✅ 基础工具完成"
+if ! apk_update_ok; then
+    log "❌ apk update 失败，等下次重试"
+    rm -f "$LOCK"; exit 1
+fi
+log "✅ apk update 成功"
 
-# ── 重型应用（仅有存储时） ──
-if [ -n "$DATA_ROOT" ]; then
+# ── 安装函数（独立计数）──────────────────────────────────────────────
+INSTALL_FAIL=0
+install_pkg() {
+    local out ret
+    log "📦 安装: $*"
+    out=$(apk add --no-cache "$@" 2>&1)
+    ret=$?
+    echo "$out" | logger -t "$LOG_TAG"
+    [ "$ret" -eq 0 ] && log "✅ 完成: $*" || {
+        log "⚠️  失败: $*"
+        INSTALL_FAIL=$((INSTALL_FAIL + 1))
+    }
+}
 
-    # Docker
-    mkdir -p "$DATA_ROOT/docker-data" /etc/docker
-    echo '{"data-root":"'$DATA_ROOT'/docker-data"}' > /etc/docker/daemon.json
+# ── 轻量工具：无论有无 U 盘直接装 ───────────────────────────────────
+install_pkg bash htop smartmontools fdisk lsblk
 
-    apk add --no-cache docker dockerd >/dev/null 2>&1 && log "✅ Docker安装完成"
+# ── Samba：装 Flash，装完修复 dbus/avahi 时序问题 ────────────────────
+install_pkg samba4-server luci-app-samba4 luci-i18n-samba4-zh-cn
+/etc/init.d/dbus restart 2>/dev/null || true
+sleep 2
+/etc/init.d/avahi-daemon restart 2>/dev/null || true
+log "✅ dbus 已重载，avahi-daemon 已启动"
 
-    mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null
-    /etc/init.d/dockerd enable 2>/dev/null
-    /etc/init.d/dockerd start 2>/dev/null
+# ── 重型应用：强依赖 U 盘，无盘跳过 ─────────────────────────────────
+if [ -n "$USB_MOUNT" ]; then
+    log "⚙️  U 盘就绪，开始安装重型应用..."
 
-    # AdGuardHome
-    apk add --no-cache adguardhome >/dev/null 2>&1 && log "✅ AGH安装完成"
+    # Swap（第一件事，缓解安装时内存压力）
+    if [ -f "$USB_MOUNT/swapfile" ]; then
+        swapon "$USB_MOUNT/swapfile" 2>/dev/null && \
+            log "✅ Swap 已开启" || \
+            log "⚠️  Swap 开启失败"
+    else
+        log "ℹ️  如需 Swap 可执行:"
+        log "ℹ️  dd if=/dev/zero of=$USB_MOUNT/swapfile bs=1M count=512 && mkswap $USB_MOUNT/swapfile"
+    fi
 
-    AGH_DIR="$DATA_ROOT/adguardhome"
-    mkdir -p "$AGH_DIR/data" "$AGH_DIR/config"
+    # Docker（先装，体积最大优先确认 Flash 空间）
+    mkdir -p "$USB_MOUNT/docker-data" /etc/docker
+    printf '{\n  "data-root": "%s/docker-data",\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' \
+        "$USB_MOUNT" > /etc/docker/daemon.json
+    log "✅ daemon.json 已写入"
 
-    uci set adguardhome.config.work_dir="$AGH_DIR/data" 2>/dev/null
-    uci set adguardhome.config.config_file="$AGH_DIR/config/adguardhome.yaml" 2>/dev/null
-    uci commit adguardhome 2>/dev/null
+    install_pkg docker dockerd
+    install_pkg luci-app-dockerman luci-i18n-dockerman-zh-cn
 
-    /etc/init.d/adguardhome enable 2>/dev/null
-    /etc/init.d/adguardhome start 2>/dev/null
+    mountpoint -q /sys/fs/cgroup || \
+        mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+    /etc/init.d/dockerd enable 2>/dev/null || true
+    /etc/init.d/dockerd start  2>/dev/null || true
+    log "✅ Docker 已启动，数据 → $USB_MOUNT/docker-data"
 
-    log "✅ AGH已运行（数据在 $DATA_ROOT）"
+    # AdGuardHome（Docker 装完后装，Flash 空间已确认够用）
+    install_pkg adguardhome luci-app-adguardhome
+
+    AGH_USB="$USB_MOUNT/AdGuardHome"
+    mkdir -p "$AGH_USB/data" "$AGH_USB/config"
+    /etc/init.d/adguardhome stop 2>/dev/null || true
+
+    # 优先保留 U 盘已有配置，重刷不覆盖
+    if [ ! -f "$AGH_USB/config/adguardhome.yaml" ] && \
+       [ -f "/etc/adguardhome/adguardhome.yaml" ]; then
+        cp -a /etc/adguardhome/. "$AGH_USB/config/"
+        log "✅ 新环境，初始配置已写入 U 盘"
+    else
+        log "ℹ️  U 盘已有旧配置，直接复用"
+    fi
+
+    uci set adguardhome.config.config_file="$AGH_USB/config/adguardhome.yaml"
+    uci set adguardhome.config.work_dir="$AGH_USB/data"
+    uci commit adguardhome
+    /etc/init.d/adguardhome enable 2>/dev/null || true
+    /etc/init.d/adguardhome start  2>/dev/null || true
+    log "✅ AdGuardHome 已启动，数据 → $AGH_USB"
+
+else
+    log "ℹ️  无 U 盘，跳过 Docker 和 AdGuardHome"
+    log "ℹ️  插入 U 盘后执行: rm /etc/install-extras-done && reboot"
 fi
 
+# ── 刷新 LuCI ────────────────────────────────────────────────────────
+rm -f /tmp/luci-indexcache* 2>/dev/null
+/etc/init.d/rpcd restart 2>/dev/null || true
+
 rm -f "$LOCK"
-touch "$DONE_FLAG"
-log "🎉 完成（极简版）"
-RUNEOF
 
-chmod +x /usr/lib/install-extras/run.sh
-
-# ── hotplug ──
-mkdir -p /etc/hotplug.d/iface
-cat > /etc/hotplug.d/iface/99-install-extras << 'EOF'
+# ── 写 DONE_FLAG（仅全部成功时）──────────────────────────────────────
+if [ "$INSTALL_FAIL" -eq 0 ]; then
+    touch "$DONE_FLAG"
+    log "🎉 install-extras 全部完成"
+else
+    log "⚠️  有 $INSTALL_FAIL 组包失败，下次 WAN UP 自动重试"
+    # 重新安装 hotplug 触发器等待下次重试
+    mkdir -p /etc/hotplug.d/iface
+    cat > /etc/hotplug.d/iface/99-install-extras << 'HOTPLUGEOF'
 #!/bin/sh
 [ "$ACTION" = "ifup" ] || exit 0
+[ -f /etc/install-extras-done ] && exit 0
+case "$INTERFACE" in
+    wan|wan6|pppoe-wan) ;;
+    *) exit 0 ;;
+esac
 /usr/lib/install-extras/run.sh &
-EOF
+HOTPLUGEOF
+    chmod +x /etc/hotplug.d/iface/99-install-extras
+fi
+RUNEOF
+chmod +x /usr/lib/install-extras/run.sh
 
+# ── hotplug 触发器（仅 WAN 接口）────────────────────────────────────
+mkdir -p /etc/hotplug.d/iface
+cat > /etc/hotplug.d/iface/99-install-extras << 'HOTPLUGEOF'
+#!/bin/sh
+[ "$ACTION" = "ifup" ] || exit 0
+[ -f /etc/install-extras-done ] && exit 0
+case "$INTERFACE" in
+    wan|wan6|pppoe-wan) ;;
+    *) exit 0 ;;
+esac
+/usr/lib/install-extras/run.sh &
+HOTPLUGEOF
 chmod +x /etc/hotplug.d/iface/99-install-extras
 
-logger -t "install-extras-mini" "✅ 极简脚本已安装"
+logger -t "install-extras" "✅ hotplug 触发器已安装"
 exit 0
