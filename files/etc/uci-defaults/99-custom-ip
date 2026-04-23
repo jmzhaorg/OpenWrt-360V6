@@ -1,46 +1,41 @@
 #!/bin/sh
 # 99-custom-ip
-# 设置 LAN IP，确保 WAN 为 DHCP 客户端模式，配置 dnsmasq 转发到 smartdns
+# 设置 LAN IP，确保 WAN 为 DHCP 客户端模式，配置 smartdns + dnsmasq
 
 # ── LAN 配置 ─────────────────────────────────────────────────────────
 uci set network.lan.ipaddr='192.168.2.1'
 uci set network.lan.netmask='255.255.255.0'
 uci commit network
 
-# ── FIX-R1: 确保 WAN 口为 DHCP 客户端模式 ───────────────────────────
+# ── WAN 确保 DHCP ─────────────────────────────────────────────────────
 WAN_PROTO=$(uci get network.wan.proto 2>/dev/null)
 if [ "$WAN_PROTO" != "dhcp" ]; then
     uci set network.wan.proto='dhcp'
     uci commit network
-    logger -t "99-custom-ip" "WAN proto 已修正为 dhcp（原值: ${WAN_PROTO:-未设置}）"
+    logger -t "99-custom-ip" "WAN proto 修正为 dhcp（原值: ${WAN_PROTO:-未设置}）"
 fi
 
-# ── FIX-R2: 配置 smartdns ─────────────────────────────────────────────
-# smartdns uci 配置：port 和 bind_device 是独立字段
-# 不要用 bind='127.0.0.1:5335'，这会损坏配置导致 "active with no instances"
+# ── smartdns 配置 ──────────────────────────────────────────────────────
+# enabled='0' 是默认值，必须显式启用，否则 procd 不启动实例
+# 导致 dnsmasq 转发到 127.0.0.1#5335 无响应，路由器自身 DNS 完全断掉
+uci set smartdns.@smartdns[0].enabled='1'
 uci set smartdns.@smartdns[0].port='5335'
 uci set smartdns.@smartdns[0].ipv6_server='0'
-# 确保 bind 字段不残留错误值
 uci delete smartdns.@smartdns[0].bind 2>/dev/null || true
 uci commit smartdns
+/etc/init.d/smartdns enable
 
-# ── FIX-R3: 配置 dnsmasq 转发到 smartdns:5335 ────────────────────────
+# ── dnsmasq 配置 ───────────────────────────────────────────────────────
+# 主转发：smartdns:5335
+# 兜底：223.5.5.5 / 8.8.8.8（smartdns 未就绪时保证路由器自身可解析）
 uci delete dhcp.@dnsmasq[0].server 2>/dev/null || true
 uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#5335'
+uci add_list dhcp.@dnsmasq[0].server='223.5.5.5'
+uci add_list dhcp.@dnsmasq[0].server='8.8.8.8'
 uci set dhcp.@dnsmasq[0].noresolv='1'
 uci set dhcp.@dnsmasq[0].localuse='1'
-# 提高并发查询上限，避免 "Maximum number of concurrent DNS queries reached"
 uci set dhcp.@dnsmasq[0].dnsforwardmax='1000'
 uci commit dhcp
 
-# ── FIX-R4: 确保 smartdns 开机自启 ──────────────────────────────────
-/etc/init.d/smartdns enable
-
-# ── FIX-R5: 确保 resolv.conf 指向 dnsmasq（防止 netifd 写错）────────
-# netifd 会在 WAN UP 时重写 /tmp/resolv.conf.d/resolv.conf.auto
-# 但本机 dnsmasq 监听 53，/etc/resolv.conf 应指向 127.0.0.1
-# OpenWrt 默认行为正确，这里只做保底
-ln -sf /tmp/resolv.conf /etc/resolv.conf 2>/dev/null || true
-
-logger -t "99-custom-ip" "LAN=192.168.2.1 WAN=dhcp smartdns:5335 dnsmasq->5335 dnsforwardmax=1000 配置完成"
+logger -t "99-custom-ip" "✅ LAN=192.168.2.1 WAN=dhcp smartdns:5335(enabled) dnsmasq兜底=223.5.5.5/8.8.8.8"
 exit 0
