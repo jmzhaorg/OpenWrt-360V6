@@ -1,18 +1,12 @@
 #!/bin/sh
 # 98-fix-apk-feeds
-# 在 uci-defaults 阶段（有网络之前）完成以下操作：
-#   1. 清理 video feed
-#   2. 把 apk world 中 apk-mbedtls 替换为 apk-openssl
-#
-# apk-openssl 的实际安装（需要网络）交给 96-install-extras 的 hotplug 触发器
-# 此处只做 world 文件修改，确保下次 apk fix/update 时使用正确的 TLS 后端
 
-# ── 1. 清理 video feed ─────────────────────────────────────────────────
+# ── 清理 video feed ────────────────────────────────────────────────
 for f in /etc/apk/repositories.d/*.list; do
     [ -f "$f" ] && sed -i '/\/video\//d' "$f"
 done
 
-# ── 2. world 文件：apk-mbedtls → apk-openssl ──────────────────────────
+# ── world 文件：apk-mbedtls → apk-openssl ─────────────────────────
 WORLD="/etc/apk/world"
 if [ -f "$WORLD" ] && grep -q "^apk-mbedtls$" "$WORLD"; then
     sed -i 's/^apk-mbedtls$/apk-openssl/' "$WORLD"
