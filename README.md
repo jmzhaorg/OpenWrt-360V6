@@ -8,17 +8,23 @@
 
 原厂固件的无线 Mesh 组网体验一般，网上现成的 OpenWrt 固件也不太符合需求。借助 AI 定制了一个只带 HomeProxy 的最简固件，体验不错，后续想进一步压榨这台路由器的性能。
 
-**折腾过程中的发现与取舍：**
+折腾过程中的发现与取舍：
 
-- ❌ 以下包在 ImmortalWrt 官方源中不存在，无法集成：
-  - `lucky` / `luci-app-lucky`
-  - `luci-app-fileassistant`
-  - `luci-app-crontabs`
+❌ 以下包在 ImmortalWrt 官方源中不存在，无法集成：
 
-- ⚠️ 360 V6 仅 128MB NAND Flash（可用约 90MB），`dockerd`、`docker-compose`、AdGuard Home 等大体积包无法直接集成进固件
-  - ✅ 改为**刷完系统后联网自动安装**
-  - ✅ **无 U 盘时不安装 dockerd**，避免占满 Flash
-  - ✅ `docker-compose` 按需手动安装到 U 盘（需空间充足或扩展 overlay）
+lucky / luci-app-lucky
+
+luci-app-fileassistant
+
+luci-app-crontabs
+
+⚠️ 360 V6 仅 128MB NAND Flash（可用约 90MB），dockerd、AdGuard Home 等大体积包无法直接集成进固件
+
+✅ 改为刷完系统后联网自动安装
+
+✅ 重型应用（Docker/AGH）强依赖 U 盘：脚本采用“路径先行”策略，先锁定 U 盘存储路径再执行安装，防止挤爆 Flash
+
+✅ 无 U 盘保护：若未检测到 U 盘，将跳过重型应用安装，确保系统稳定
 
 ---
 
@@ -35,39 +41,44 @@
 
 ---
 
-## 📦 固件内置功能
+🖥️ 基础系统
+界面语言：中文
 
-### 🖥️ 基础系统
+主题：Argon（深色/浅色自适应）
 
-- **界面语言**：中文
-- **主题**：Argon（深色/浅色自适应）
-- **管理地址**：`http://192.168.2.1`
-- **默认账户**：用户名 `root`，密码为空
-- **DNS 架构**：`dnsmasq (:53)` → `SmartDNS (:5335)` → 上游，兜底 `223.5.5.5` / `8.8.8.8`
+管理地址：http://192.168.2.1
 
-### 🌐 代理
+默认账户：用户名 root，密码为空
 
-- **HomeProxy**：基于 sing-box 的透明代理，支持 VLESS / VMess / Trojan / Hysteria2 等主流协议，开箱即用
+DNS 架构：dnsmasq (:53) → SmartDNS (:5335) → 上游，兜底 223.5.5.5 / 8.8.8.8
 
-### 🌍 网络
+🌐 代理
+HomeProxy：基于 sing-box 的透明代理，支持 VLESS / VMess / Trojan / Hysteria2 等主流协议，开箱即用
 
-- **SmartDNS**：监听 `127.0.0.1:5335`，dnsmasq 转发，防污染 + 测速优选
-- **DDNS**：支持 Cloudflare 动态域名解析
-- **UPnP**：自动端口映射（miniupnpd，基于 nftables）
-- **IPv6**：odhcp6c + odhcpd + ipv6helper，支持 DHCPv6 / SLAAC
-- **BBR**：TCP 拥塞控制算法，提升高延迟网络吞吐量
+🌍 网络
+SmartDNS：监听 127.0.0.1:5335，dnsmasq 转发，防污染 + 测速优选
 
-### 💾 存储
+DDNS：支持 Cloudflare 动态域名解析
 
-- **USB 自动挂载**：支持 ext4 / NTFS3 / exFAT / FAT32 / btrfs
-- **DiskMan**：磁盘管理 LuCI 界面
+UPnP：自动端口映射（miniupnpd，基于 nftables）
 
-### 🐳 Docker
+IPv6：odhcp6c + odhcpd + ipv6helper，支持 DHCPv6 / SLAAC
 
-> Flash 空间有限，固件内仅包含 `docker` 客户端，不含 `docker-compose`。
+BBR：TCP 拥塞控制算法，提升高延迟网络吞吐量
 
-- `dockerd`：检测到 U 盘后由首次开机脚本**自动安装**，Docker 数据目录自动指向 U 盘
-- `docker-compose`：按需手动安装到 U 盘：
+💾 存储
+USB 自动挂载：支持 ext4 / NTFS3 / exFAT / FAT32 / btrfs
+
+DiskMan：磁盘管理 LuCI 界面
+
+🐳 Docker & AdGuard Home
+Flash 空间极度有限，重型应用必须配合 U 盘使用。
+
+路径先行策略：脚本在安装前会自动将 Docker 的 data-root 和 AGH 的 work_dir 指向 U 盘，避免在 Flash 产生任何运行数据。
+
+Swap 支持：自动检测 U 盘根目录下的 swapfile 文件并挂载，缓解 512MB 内存运行 Docker 的压力。
+
+docker-compose：按需手动安装到 U 盘：
 
 ```sh
 mkdir -p /mnt/sda1/bin
@@ -87,9 +98,7 @@ ln -sf /mnt/sda1/bin/docker-compose /usr/local/bin/docker-compose
 
 ---
 
-## 🚀 首次开机自动安装（需联网）
-
-WAN 口上线后，后台自动触发安装以下软件包，**无需手动操作**，安装完成后 LuCI 界面自动刷新。
+🚀 首次开机自动安装（需联网）WAN 口上线后，后台自动触发安装以下软件包。软件包说明AdGuard Home需检测到 U 盘。安装后配置与运行数据自动指向 U 盘，支持复用旧配置。Samba4Windows 网络共享（SMB），配合 USB 硬盘使用。dockerd + luci-app-dockerman仅检测到 U 盘时安装。数据目录强制指向 U 盘。bash / htop / fdisk / lsblk常用命令行工具。smartmontools硬盘 S.M.A.R.T. 检测。🔍 安装日志：LuCI → 状态 → 系统日志，搜索 install-extras🔁 安装失败：若因网络不稳定导致失败，重新插拔 WAN 口网线或重启后会自动重试。
 
 | 软件包 | 说明 |
 |--------|------|
