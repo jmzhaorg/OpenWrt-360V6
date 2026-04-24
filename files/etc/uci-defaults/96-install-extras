@@ -1,92 +1,150 @@
 #!/bin/sh
-# 96-install-extras [Final v4.2]
-# 适用：360 V6 / 小米 CR660x / IPQ6000 (128M Flash)
-# 修复：并行ping孤儿进程 / 管道覆盖apk退出码 / block hotplug挂载竞态
-# 特性：双阶段DONE_FLAG / block热插拔哨兵 / zram兜底 / 状态监控工具
+# 96-install-extras [v1 - Fusion Edition]
 
 DONE_FLAG="/etc/install-extras-done"
 USB_DONE="/etc/install-usb-done"
+STATE_DIR="/etc/install-state"
 
-mkdir -p /usr/lib/install-extras /usr/bin /etc/hotplug.d/iface /etc/hotplug.d/block
+mkdir -p "$STATE_DIR" /usr/lib/install-extras /usr/bin \
+         /etc/hotplug.d/iface /etc/hotplug.d/block \
+         /etc/dbus-1
 
 # ══════════════════════════════════════════════════════════════
-# 模块 0：状态查询工具 (360v6-status)
+# 模块 0：360v6-status 状态查询工具
 # ══════════════════════════════════════════════════════════════
 cat > /usr/bin/360v6-status << 'STATUSEOF'
 #!/bin/sh
-echo "🔍 360 V6 部署状态 @ $(date '+%Y-%m-%d %H:%M:%S')"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-[ -f /etc/install-extras-done ] \
-    && echo "✅ 基础环境: 已完成" \
-    || echo "⏳ 基础环境: 待触发/安装中"
-[ -f /etc/install-usb-done ] \
-    && echo "✅ 重型应用: 已完成" \
-    || echo "⏳ 重型应用: 待 U 盘/安装中"
+STATE_DIR="/etc/install-state"
+echo "=== 360 V6 部署状态 @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+echo ""
+
+if [ -f /etc/install-extras-done ]; then
+    echo "[OK] 基础环境：已完成"
+else
+    echo "[..] 基础环境：待触发 / 安装中"
+fi
+p1=$(cat "$STATE_DIR/phase1-failures" 2>/dev/null || echo "0")
+[ "$p1" -gt 0 ] && echo "     重试失败次数: $p1/3"
+
+if [ -f /etc/install-usb-done ]; then
+    echo "[OK] 重型应用：已完成"
+else
+    echo "[..] 重型应用：待 U 盘 / 安装中"
+fi
+p2=$(cat "$STATE_DIR/phase2-failures" 2>/dev/null || echo "0")
+[ "$p2" -gt 0 ] && echo "     重试失败次数: $p2/3"
+
 echo ""
 df -h /overlay 2>/dev/null \
-    | awk 'NR==2 {print "📦 Flash: "$3" used / "$2" total ("$5")"}'
+    | awk 'NR==2 {print "Flash : "$3" used / "$2" total ("$5")"}'
 free -h 2>/dev/null \
-    | awk '/Mem:/ {print "🧠 内存: 已用 "$3" / 总计 "$2}'
+    | awk '/Mem:/ {print "Mem   : "$3" used / "$2" total"}'
 echo ""
+
+for mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
+    mountpoint -q "$mp" 2>/dev/null && echo "USB   : $mp (已挂载)"
+done
+
+grep -q zram     /proc/swaps 2>/dev/null && echo "Swap  : zram 已激活"
+grep -q swapfile /proc/swaps 2>/dev/null && echo "Swap  : swapfile 已激活"
+echo ""
+
 docker info >/dev/null 2>&1 \
-    && echo "🐳 Docker: 运行中" || echo "🐳 Docker: 未启动"
+    && echo "[OK] Docker      : 运行中" \
+    || echo "[--] Docker      : 未启动"
 pgrep AdGuardHome >/dev/null 2>&1 \
-    && echo "🛡️  AdGuardHome: 运行中" || echo "🛡️  AdGuardHome: 未启动"
-grep -q zram    /proc/swaps 2>/dev/null && echo "💾 zram: 已激活（内存压缩）"
-grep -q swapfile /proc/swaps 2>/dev/null && echo "🔌 U盘 Swap: 已激活"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "💡 手动重跑基础环境: /usr/lib/install-extras/run.sh"
-echo "💡 手动重跑重型应用: /usr/lib/install-extras/install-usb.sh"
+    && echo "[OK] AdGuardHome : 运行中" \
+    || echo "[--] AdGuardHome : 未启动"
+echo ""
+echo "手动重跑基础环境 : rm -f /etc/install-extras-done $STATE_DIR/phase1-failures && /usr/lib/install-extras/run.sh"
+echo "手动重跑重型应用 : rm -f /etc/install-usb-done   $STATE_DIR/phase2-failures && /usr/lib/install-extras/install-usb.sh"
 STATUSEOF
 chmod +x /usr/bin/360v6-status
 
 # ══════════════════════════════════════════════════════════════
-# 模块 A：install-usb.sh（重型应用：Docker / AGH）
+# 模块 A：install-usb.sh（Phase 2 重型应用）
 # ══════════════════════════════════════════════════════════════
 cat > /usr/lib/install-extras/install-usb.sh << 'USBEOF'
 #!/bin/sh
 LOG_TAG="usb-extras"
 USB_DONE="/etc/install-usb-done"
 USB_LOCK="/tmp/install-usb.lock"
+STATE_DIR="/etc/install-state"
 
 log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
 
-[ -f "$USB_DONE" ] && { log "ℹ️  重型应用已安装，跳过"; exit 0; }
+mkdir -p "$STATE_DIR"
+
+# ── 幂等 / 锁保护 ────────────────────────────────────────
+[ -f "$USB_DONE" ] && { log "ℹ️  重型应用已完成，跳过"; exit 0; }
 [ -f "$USB_LOCK" ] && { log "⚠️  实例运行中，跳过"; exit 0; }
+
+# ── 重试计数保护 ─────────────────────────────────────────
+__usb_fail=$(cat "$STATE_DIR/phase2-failures" 2>/dev/null || echo "0")
+if [ "${__usb_fail:-0}" -ge 3 ]; then
+    log "❌ 失败次数过多（${__usb_fail}/3），停止自动重试"
+    log "ℹ️  手动修复: rm -f $STATE_DIR/phase2-failures && $0"
+    exit 1
+fi
+
 touch "$USB_LOCK"
 
-# ── U 盘挂载点解析 ──────────────────────────────────────────
-USB_MOUNT="$1"
-if [ -z "$USB_MOUNT" ]; then
-    for mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
-        mountpoint -q "$mp" 2>/dev/null && { USB_MOUNT="$mp"; break; }
+# ── DNS 恢复函数（变量名前缀 + 标志位控制）────────────────
+__usb_dns_restore=0
+__usb_dns_old=""
+__usb_restore_dns() {
+    [ "$__usb_dns_restore" = "1" ] || return
+    if [ -n "$__usb_dns_old" ]; then
+        printf '%s' "$__usb_dns_old" > /etc/resolv.conf
+    else
+        printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
+    fi
+}
+
+# ── trap：合并注册，锁清理 + DNS 恢复 ─────────────────────
+trap 'rm -f "$USB_LOCK"; __usb_restore_dns' EXIT INT TERM
+
+# ── 确定挂载点 ───────────────────────────────────────────
+USB_MOUNT=""
+if [ -n "${1:-}" ] && mountpoint -q "$1" 2>/dev/null; then
+    USB_MOUNT="$1"
+else
+    for __usb_mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
+        mountpoint -q "$__usb_mp" 2>/dev/null && { USB_MOUNT="$__usb_mp"; break; }
     done
 fi
 if [ -z "$USB_MOUNT" ]; then
-    log "❌ 未检测到 U 盘挂载点，退出"
-    rm -f "$USB_LOCK"; exit 1
+    log "❌ 未找到 U 盘挂载点，退出"
+    echo $((__usb_fail + 1)) > "$STATE_DIR/phase2-failures"
+    exit 1
 fi
 log "▶ 重型应用部署启动 | 目标: $USB_MOUNT"
 
-# ── 网络/DNS 保护（仅在 DNS 异常时注入，退出时恢复）────────
-RESTORE_DNS=0
-OLD_RESOLV=""
+# ── U 盘空间预检（需 ≥ 2GB）────────────────────────────
+USB_FREE_KB=$(df -k "$USB_MOUNT" 2>/dev/null | awk 'NR==2{print $4}')
+if [ "${USB_FREE_KB:-0}" -lt 2097152 ]; then
+    log "⚠️  U 盘可用空间不足（${USB_FREE_KB}KB < 2GB），跳过重型应用"
+    touch "$USB_DONE"
+    exit 0
+fi
+
+# ── DNS 保护（仅在异常时注入）────────────────────────────
 if ! nslookup baidu.com >/dev/null 2>&1; then
     log "⚠️  DNS 未就绪，注入临时 DNS"
-    OLD_RESOLV=$(cat /etc/resolv.conf 2>/dev/null)
+    __usb_dns_old=$(cat /etc/resolv.conf 2>/dev/null)
     printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
-    RESTORE_DNS=1
+    __usb_dns_restore=1
 fi
-trap '[ "$RESTORE_DNS" = "1" ] && [ -n "$OLD_RESOLV" ] && echo "$OLD_RESOLV" > /etc/resolv.conf' EXIT
 
-# ── I/O 调度优化 ────────────────────────────────────────────
-USB_DEV=$(mount | grep " $USB_MOUNT " | awk '{print $1}' | sed 's|/dev/||;s|[0-9]*$||')
+# ── I/O 调度优化 ────────────────────────────────────────
+USB_DEV=$(mount | grep " $USB_MOUNT " | awk '{print $1}' \
+    | sed 's|/dev/||;s|[0-9]*$||')
 SCHED="/sys/block/${USB_DEV}/queue/scheduler"
 if [ -n "$USB_DEV" ] && [ -f "$SCHED" ]; then
     if grep -q "mq-deadline" "$SCHED" 2>/dev/null; then
         echo "mq-deadline" > "$SCHED" 2>/dev/null
     else
-        echo "deadline"    > "$SCHED" 2>/dev/null
+        echo "deadline" > "$SCHED" 2>/dev/null
     fi
     log "⚡ I/O 调度器: $(cat "$SCHED" 2>/dev/null | grep -oE '\[[^]]+\]' | tr -d '[]')"
 fi
@@ -94,77 +152,127 @@ echo "10"    > /proc/sys/vm/swappiness      2>/dev/null
 echo "16384" > /proc/sys/vm/min_free_kbytes 2>/dev/null
 log "⚡ 内存参数: swappiness=10, min_free_kbytes=16MB"
 
-# ── Swap（原子写入，防断电损坏）────────────────────────────
-if [ ! -f "$USB_MOUNT/swapfile" ]; then
-    log "⏳ 创建 256MB Swap（原子写入）..."
-    if dd if=/dev/zero of="$USB_MOUNT/swapfile.tmp" bs=1M count=256 2>/dev/null; then
-        mv "$USB_MOUNT/swapfile.tmp" "$USB_MOUNT/swapfile"
-        sync
-        chmod 600 "$USB_MOUNT/swapfile"
-        mkswap "$USB_MOUNT/swapfile" >/dev/null 2>&1
-        log "✅ Swap 文件已创建"
-    else
-        rm -f "$USB_MOUNT/swapfile.tmp"
-        log "⚠️  Swap 创建失败（U 盘空间不足？）"
+# ── Swap（原子写入 + fstab 持久化）─────────────────────
+SWAPFILE="$USB_MOUNT/swapfile"
+if ! grep -q swapfile /proc/swaps 2>/dev/null; then
+    if [ ! -f "$SWAPFILE" ]; then
+        log "⏳ 创建 256MB Swap（原子写入）..."
+        if dd if=/dev/zero of="${SWAPFILE}.tmp" bs=1M count=256 2>/dev/null; then
+            mv "${SWAPFILE}.tmp" "$SWAPFILE"
+            sync
+            chmod 600 "$SWAPFILE"
+            mkswap "$SWAPFILE" >/dev/null 2>&1
+            log "✅ Swap 文件已创建"
+        else
+            rm -f "${SWAPFILE}.tmp"
+            log "⚠️  Swap 创建失败（U 盘空间不足？）"
+        fi
+    fi
+    if [ -f "$SWAPFILE" ]; then
+        swapon "$SWAPFILE" 2>/dev/null \
+            && log "✅ Swap 已激活" \
+            || log "ℹ️  Swap 激活失败（可能已挂载）"
+        grep -qF "$SWAPFILE" /etc/fstab 2>/dev/null \
+            || echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
     fi
 fi
-if [ -f "$USB_MOUNT/swapfile" ]; then
-    swapon "$USB_MOUNT/swapfile" 2>/dev/null \
-        && log "✅ Swap 已激活" \
-        || log "⚠️  Swap 激活失败（可能已挂载）"
-fi
 
-# ── 安装函数（修复：拆分管道，正确捕获 apk 退出码）────────
-# ⚠️  v4.1 bug：apk ... 2>&1 | logger 会让 logger 的退出码覆盖 apk 的，
-#    导致 $INSTALL_FAIL 永远不增加。此处改为先写临时文件再 logger。
+# ── 等待 apk 数据库锁释放（最长 60 秒）─────────────────
+log "⏳ 等待 apk 数据库就绪..."
+for __usb_i in $(seq 1 30); do
+    apk info >/dev/null 2>&1 && break
+    log "⏳ apk 锁占用，等待... ($__usb_i/30)"
+    sleep 2
+done
+if ! apk info >/dev/null 2>&1; then
+    log "❌ apk 数据库长时间锁定，退出"
+    echo $((__usb_fail + 1)) > "$STATE_DIR/phase2-failures"
+    exit 1
+fi
+log "✅ apk 数据库就绪"
+
+# ── Flash 空间检测（控制 LuCI 安装）────────────────────
+FLASH_FREE=$(df /overlay 2>/dev/null | awk 'NR==2 {print $4}')
+SKIP_LUCI=0
+[ "${FLASH_FREE:-99999}" -lt 25000 ] && SKIP_LUCI=1 \
+    && log "⚠️  Flash <25MB，跳过可选 LuCI 包"
+
+# ── 安装函数（ash 兼容，带返回码 + 注释说明 local）──────
 INSTALL_FAIL=0
 install_pkg() {
-    local tmp ret
-    tmp=$(mktemp /tmp/apk-out.XXXXXX)
+    # NOTE: BusyBox ash supports 'local'; safe for ImmortalWrt target
+    local __ip_tmp __ip_ret
+    __ip_tmp=$(mktemp /tmp/apk-out.XXXXXX)
     log "📦 安装: $*"
-    apk add --no-cache "$@" > "$tmp" 2>&1
-    ret=$?
-    cat "$tmp" | logger -t "$LOG_TAG"
-    rm -f "$tmp"
-    if [ "$ret" -eq 0 ]; then
+    apk add --no-cache "$@" > "$__ip_tmp" 2>&1
+    __ip_ret=$?
+    cat "$__ip_tmp" | logger -t "$LOG_TAG"
+    rm -f "$__ip_tmp"
+    if [ "$__ip_ret" -eq 0 ]; then
         log "✅ 完成: $*"
     else
-        log "❌ 失败: $* (exit $ret)"
+        log "❌ 失败: $* (exit $__ip_ret)"
         INSTALL_FAIL=$((INSTALL_FAIL + 1))
     fi
+    return $__ip_ret
 }
 
-# ── Flash 空间检测（供 LuCI 安装决策使用）──────────────────
-FLASH_FREE=$(df /overlay 2>/dev/null | awk 'NR==2 {print $4}')
-
-# ── Docker 部署 ─────────────────────────────────────────────
+# ── Docker 部署 ─────────────────────────────────────────
 log "📦 部署 Docker..."
 mkdir -p "$USB_MOUNT/docker-data" /etc/docker
-cat > /etc/docker/daemon.json << EOD
+cat > /etc/docker/daemon.json << DAEMONJSON
 {
   "data-root": "$USB_MOUNT/docker-data",
   "storage-driver": "overlay2",
   "log-driver": "json-file",
   "log-opts": {"max-size": "5m", "max-file": "2"}
 }
-EOD
+DAEMONJSON
+log "✅ daemon.json 已写入 | data-root=$USB_MOUNT/docker-data"
 
-install_pkg docker dockerd
-if [ "$INSTALL_FAIL" -eq 0 ]; then
-    mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
-    /etc/init.d/dockerd enable 2>/dev/null || true
-    /etc/init.d/dockerd start  2>/dev/null || true
-    log "✅ Docker 已启动 | data-root: $USB_MOUNT/docker-data"
+install_pkg docker
+
+# dockerd 单独强制安装（绕过 kmod 版本依赖冲突）
+log "📦 强制安装: dockerd"
+__usb_dk_tmp=$(mktemp /tmp/apk-out.XXXXXX)
+apk add --no-cache --force-broken-world dockerd > "$__usb_dk_tmp" 2>&1
+__usb_dk_ret=$?
+cat "$__usb_dk_tmp" | logger -t "$LOG_TAG"
+rm -f "$__usb_dk_tmp"
+if [ "$__usb_dk_ret" -eq 0 ]; then
+    log "✅ 完成: dockerd"
+else
+    log "❌ 失败: dockerd (exit $__usb_dk_ret)"
+    INSTALL_FAIL=$((INSTALL_FAIL + 1))
 fi
 
-if [ "${FLASH_FREE:-99999}" -ge 25000 ]; then
+if [ "$SKIP_LUCI" -eq 0 ]; then
     install_pkg luci-app-dockerman luci-i18n-dockerman-zh-cn
 else
-    log "ℹ️  Flash <25MB，跳过 dockerman LuCI（可用 CLI 管理）"
+    log "ℹ️  跳过 dockerman LuCI（Flash 紧张，可用 CLI 管理）"
 fi
 
-# ── AdGuardHome 部署 ────────────────────────────────────────
+# Docker 服务启动 + 健康检查
+_DOCKER_OK=0
+if [ "$INSTALL_FAIL" -eq 0 ]; then
+    mountpoint -q /sys/fs/cgroup \
+        || mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+    /etc/init.d/dockerd enable 2>/dev/null || true
+    /etc/init.d/dockerd start  2>/dev/null || true
+    for __usb_di in $(seq 1 10); do
+        docker info >/dev/null 2>&1 && { _DOCKER_OK=1; break; }
+        sleep 2
+    done
+    [ "$_DOCKER_OK" -eq 1 ] \
+        && log "✅ Docker 已启动 | data-root: $USB_MOUNT/docker-data" \
+        || log "⚠️  Docker 服务未能在 20 秒内响应"
+else
+    log "⚠️  Docker 安装有失败项，跳过启动"
+fi
+
+# ── AdGuardHome 部署 ────────────────────────────────────
 log "📦 部署 AdGuardHome..."
+__fail_before_agh=$INSTALL_FAIL
 install_pkg adguardhome
 
 AGH_DIR="$USB_MOUNT/AdGuardHome"
@@ -181,9 +289,9 @@ else
 fi
 
 # 运行数据迁移（首次且源目录非空时）
-if [ ! "$(ls -A "$AGH_DIR/data" 2>/dev/null)" ] \
+if [ -z "$(ls -A "$AGH_DIR/data" 2>/dev/null)" ] \
 && [ -d "/var/lib/adguardhome" ] \
-&& [ "$(ls -A /var/lib/adguardhome 2>/dev/null)" ]; then
+&& [ -n "$(ls -A /var/lib/adguardhome 2>/dev/null)" ]; then
     cp -a /var/lib/adguardhome/. "$AGH_DIR/data/" 2>/dev/null
     log "✅ AGH 运行数据已迁移至 U 盘（首次）"
 else
@@ -197,236 +305,313 @@ uci commit adguardhome 2>/dev/null || true
 /etc/init.d/adguardhome start  2>/dev/null || true
 log "✅ AdGuardHome 已启动 | 配置+数据: $AGH_DIR"
 
-if [ "${FLASH_FREE:-99999}" -ge 25000 ]; then
+if [ "$SKIP_LUCI" -eq 0 ]; then
     install_pkg luci-app-adguardhome
 else
-    log "ℹ️  Flash <25MB，跳过 adguardhome LuCI（可用 :3000 Web 管理）"
+    log "ℹ️  跳过 adguardhome LuCI（Flash 紧张，可用 :3000 Web 管理）"
 fi
 
-# ── 收尾 ────────────────────────────────────────────────────
+# ── 刷新 LuCI ───────────────────────────────────────────
 rm -f /tmp/luci-indexcache* 2>/dev/null || true
 /etc/init.d/rpcd restart 2>/dev/null || true
-rm -f "$USB_LOCK"
 
-if [ "$INSTALL_FAIL" -eq 0 ]; then
+# ── 收尾：独立检查 Docker/AGH 状态，精准决策 ───────────
+# ✅ 融合点：不依赖统一 INSTALL_FAIL，改用运行时健康检查
+_AGH_OK=0
+pgrep -x AdGuardHome >/dev/null 2>&1 && _AGH_OK=1
+
+if [ "$_DOCKER_OK" -eq 1 ] || [ "$_AGH_OK" -eq 1 ]; then
     touch "$USB_DONE"
-    log "🎉 重型应用部署完成"
+    rm -f "$STATE_DIR/phase2-failures"
+    log "🎉 重型应用部署完成 [Docker:$([ "$_DOCKER_OK" -eq 1 ]&&echo OK||echo FAIL) AGH:$([ "$_AGH_OK" -eq 1 ]&&echo OK||echo FAIL)]"
     exit 0
 else
-    log "⚠️  $INSTALL_FAIL 组包失败，U 盘下次插入时自动重试"
+    echo $((__usb_fail + 1)) > "$STATE_DIR/phase2-failures"
+    log "⚠️  Docker+AGH 均未通过健康检查（重试 $((__usb_fail + 1))/3）"
+    log "ℹ️  手动重跑: rm -f /etc/install-usb-done $STATE_DIR/phase2-failures && /usr/lib/install-extras/install-usb.sh"
     exit 1
 fi
 USBEOF
 chmod +x /usr/lib/install-extras/install-usb.sh
 
 # ══════════════════════════════════════════════════════════════
-# 模块 B：run.sh（基础环境部署）
+# 模块 B：run.sh（Phase 1 基础环境）
 # ══════════════════════════════════════════════════════════════
 cat > /usr/lib/install-extras/run.sh << 'RUNEOF'
 #!/bin/sh
 LOG_TAG="install-main"
 DONE_FLAG="/etc/install-extras-done"
 USB_DONE="/etc/install-usb-done"
-LOCK="/tmp/install-main.lock"
+RUN_LOCK="/tmp/install-main.lock"
+STATE_DIR="/etc/install-state"
 
 log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
 
+mkdir -p "$STATE_DIR"
+
+# ── 幂等 / 锁保护 ────────────────────────────────────────
 [ -f "$DONE_FLAG" ] && { log "ℹ️  基础环境已完成，跳过"; exit 0; }
-[ -f "$LOCK" ]      && { log "⚠️  实例运行中，跳过"; exit 0; }
-touch "$LOCK"
+[ -f "$RUN_LOCK"  ] && { log "⚠️  实例运行中，跳过"; exit 0; }
 
-log "▶ Final v4.2 基础环境启动"
+# ── 重试计数保护 ─────────────────────────────────────────
+__main_fail=$(cat "$STATE_DIR/phase1-failures" 2>/dev/null || echo "0")
+if [ "${__main_fail:-0}" -ge 3 ]; then
+    log "❌ 失败次数过多（${__main_fail}/3），停止自动重试"
+    log "ℹ️  手动修复: rm -f $STATE_DIR/phase1-failures $RUN_LOCK && $0"
+    exit 1
+fi
 
-# ── 清理无效软件源 ───────────────────────────────────────────
-for f in /etc/apk/repositories.d/*.list; do
-    [ -f "$f" ] && sed -i '/\/video\//d' "$f"
+touch "$RUN_LOCK"
+
+# ── DNS 恢复函数（变量名前缀 + 标志位控制）────────────────
+__main_dns_restore=0
+__main_dns_old=""
+__main_restore_dns() {
+    [ "$__main_dns_restore" = "1" ] || return
+    if [ -n "$__main_dns_old" ]; then
+        printf '%s' "$__main_dns_old" > /etc/resolv.conf
+    else
+        printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
+    fi
+    /etc/init.d/dnsmasq restart 2>/dev/null || true
+    log "✅ resolv.conf 已恢复，DNS 交还 dnsmasq"
+}
+
+# ── trap：合并注册，锁清理 + DNS 恢复 ─────────────────────
+trap 'rm -f "$RUN_LOCK"; __main_restore_dns' EXIT INT TERM
+
+log "▶ v1 基础环境启动"
+
+# ── 清理无效软件源 ───────────────────────────────────────
+for __main_f in /etc/apk/repositories.d/*.list; do
+    [ -f "$__main_f" ] && sed -i '/\/video\//d' "$__main_f"
 done 2>/dev/null
 
-# ── 等待网络（最长 3 分钟，串行双 DNS）─────────────────────
-# ⚠️  v4.1 bug：并行 ping 的 wait $PID2 永远不会执行到（PID1失败后
-#    直接 continue，PID2 变孤儿进程）。改为串行，逻辑清晰且等价。
+# ── 等待网络（最长 3 分钟）──────────────────────────────
 sleep 10
 NETWORK_OK=0
-for i in $(seq 1 36); do
+for __main_ni in $(seq 1 36); do
     ping -c1 -W2 223.5.5.5 >/dev/null 2>&1 && { NETWORK_OK=1; break; }
     ping -c1 -W2 8.8.8.8   >/dev/null 2>&1 && { NETWORK_OK=1; break; }
     sleep 5
 done
 if [ "$NETWORK_OK" -eq 0 ]; then
-    log "❌ 网络不可达，等待下次 WAN UP 重试"
-    rm -f "$LOCK"; exit 1
+    log "❌ 网络不可达，等待下次重试"
+    echo $((__main_fail + 1)) > "$STATE_DIR/phase1-failures"
+    exit 1
 fi
 log "✅ 网络已就绪"
 
-# ── DNS 注入 + apk update（HTTPS→HTTP 自动降级）────────────
+# ── DNS 注入 ────────────────────────────────────────────
+__main_dns_old=$(cat /etc/resolv.conf 2>/dev/null)
 printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+__main_dns_restore=1
+log "✅ 临时 DNS 已注入"
 
+# ── Flash 空间预检（< 20MB 直接中止防变砖）──────────────
+FLASH_FREE=$(df /overlay 2>/dev/null | awk 'NR==2 {print $4}')
+FLASH_USED=$(df /overlay 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
+log "📊 Flash: 已用 ${FLASH_USED:-?}% | 剩余 ${FLASH_FREE:-?}KB"
+if [ "${FLASH_FREE:-0}" -lt 20480 ]; then
+    log "❌ Flash 剩余不足 20MB，中止安装防止变砖"
+    echo $((__main_fail + 1)) > "$STATE_DIR/phase1-failures"
+    exit 1
+fi
+
+SKIP_LUCI=0
+[ "${FLASH_FREE:-99999}" -lt 25000 ] && SKIP_LUCI=1 \
+    && log "⚠️  Flash <25MB，跳过可选 LuCI 包"
+
+# ── apk update（HTTPS → HTTP 自动降级 + 解析加固）──────
 apk_update_ok() {
-    local tmp n
-    tmp=$(mktemp /tmp/apk-upd.XXXXXX)
-    apk update > "$tmp" 2>&1
-    cat "$tmp" | logger -t "$LOG_TAG"
-    n=$(grep -oE 'OK: [0-9]+ distinct' "$tmp" | grep -oE '[0-9]+')
-    rm -f "$tmp"
-    [ "${n:-0}" -gt 800 ] && return 0
+    # NOTE: BusyBox ash supports 'local'; safe for ImmortalWrt target
+    local __au_tmp __au_n
+    __au_tmp=$(mktemp /tmp/apk-upd.XXXXXX)
+    apk update > "$__au_tmp" 2>&1
+    cat "$__au_tmp" | logger -t "$LOG_TAG"
+    # ✅ 融合点：head -1 取首行 + 默认值保护，防解析异常
+    __au_n=$(grep -oE 'OK: [0-9]+ distinct' "$__au_tmp" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+    __au_n=${__au_n:-0}
+    rm -f "$__au_tmp"
+    [ "$__au_n" -gt 800 ] && return 0
 
-    log "⚠️  HTTPS 源包数不足（${n:-0}），切换 HTTP 重试..."
-    for f in /etc/apk/repositories.d/*.list; do
-        [ -f "$f" ] && sed -i 's|https://|http://|g' "$f"
+    log "⚠️  HTTPS 源包数不足（${__au_n}），切换 HTTP 重试..."
+    for __au_f in /etc/apk/repositories.d/*.list; do
+        [ -f "$__au_f" ] && sed -i 's|https://|http://|g' "$__au_f"
     done
-    tmp=$(mktemp /tmp/apk-upd.XXXXXX)
-    apk update > "$tmp" 2>&1
-    cat "$tmp" | logger -t "$LOG_TAG"
-    n=$(grep -oE 'OK: [0-9]+ distinct' "$tmp" | grep -oE '[0-9]+')
-    rm -f "$tmp"
-    [ "${n:-0}" -gt 800 ] && return 0
+    __au_tmp=$(mktemp /tmp/apk-upd.XXXXXX)
+    apk update > "$__au_tmp" 2>&1
+    cat "$__au_tmp" | logger -t "$LOG_TAG"
+    __au_n=$(grep -oE 'OK: [0-9]+ distinct' "$__au_tmp" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+    __au_n=${__au_n:-0}
+    rm -f "$__au_tmp"
+    [ "$__au_n" -gt 800 ] && return 0
     return 1
 }
 
 if ! apk_update_ok; then
     log "❌ apk update 失败，等待下次重试"
-    rm -f "$LOCK"; exit 1
+    echo $((__main_fail + 1)) > "$STATE_DIR/phase1-failures"
+    exit 1
 fi
 log "✅ apk update 成功"
 
-# ── Flash 空间检测 ───────────────────────────────────────────
-FLASH_FREE=$(df /overlay 2>/dev/null | awk 'NR==2 {print $4}')
-FLASH_USED=$(df /overlay 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
-log "📊 Flash: 已用 ${FLASH_USED:-?}% | 剩余 ${FLASH_FREE:-?}KB"
-
-SKIP_LUCI=0
-[ "${FLASH_FREE:-99999}" -lt 25000 ] && SKIP_LUCI=1 \
-    && log "⚠️  Flash <25MB，跳过可选 LuCI"
-
-# ── 安装函数（同样修复管道退出码问题）──────────────────────
+# ── 安装函数（带注释说明 local）────────────────────────
 INSTALL_FAIL=0
 install_pkg() {
-    local tmp ret
-    tmp=$(mktemp /tmp/apk-out.XXXXXX)
+    # NOTE: BusyBox ash supports 'local'; safe for ImmortalWrt target
+    local __ip_tmp __ip_ret
+    __ip_tmp=$(mktemp /tmp/apk-out.XXXXXX)
     log "📦 安装: $*"
-    apk add --no-cache "$@" > "$tmp" 2>&1
-    ret=$?
-    cat "$tmp" | logger -t "$LOG_TAG"
-    rm -f "$tmp"
-    [ "$ret" -eq 0 ] && log "✅ 完成: $*" || {
-        log "❌ 失败: $* (exit $ret)"
+    apk add --no-cache "$@" > "$__ip_tmp" 2>&1
+    __ip_ret=$?
+    cat "$__ip_tmp" | logger -t "$LOG_TAG"
+    rm -f "$__ip_tmp"
+    if [ "$__ip_ret" -eq 0 ]; then
+        log "✅ 完成: $*"
+    else
+        log "❌ 失败: $* (exit $__ip_ret)"
         INSTALL_FAIL=$((INSTALL_FAIL + 1))
-    }
+    fi
 }
 
-# ── 基础工具 ────────────────────────────────────────────────
-install_pkg bash htop lsblk smartmontools fdisk
-install_pkg samba4-server
+# ── 基础工具（逐包安装，单个失败不阻断其他）───────────
+install_pkg bash
+install_pkg htop
+install_pkg lsblk
+install_pkg smartmontools
+install_pkg fdisk
 
-if [ "$SKIP_LUCI" -eq 0 ]; then
-    install_pkg luci-app-samba4 luci-i18n-samba4-zh-cn
+# ── Samba（检查 Flash 空间）────────────────────────────
+FLASH_FREE=$(df /overlay 2>/dev/null | awk 'NR==2 {print $4}')
+if [ "${FLASH_FREE:-0}" -ge 65536 ]; then
+    install_pkg samba4-server
+    if [ "$SKIP_LUCI" -eq 0 ]; then
+        install_pkg luci-app-samba4 luci-i18n-samba4-zh-cn
+    else
+        log "ℹ️  跳过 luci-app-samba4（Flash 紧张）"
+    fi
 else
-    log "ℹ️  跳过 luci-app-samba4（Flash 紧张）"
+    log "⚠️  Flash 不足 64MB（${FLASH_FREE}KB），跳过 samba4"
 fi
 
-# ── 修复 avahi 崩溃（Samba 热安装后 dbus 未重载）───────────
-/etc/init.d/dbus restart 2>/dev/null || true
+# ── 修复 avahi 崩溃循环（stop→restart 清除残留进程）────
+mkdir -p /etc/dbus-1
+/etc/init.d/avahi-daemon stop 2>/dev/null || true
+sleep 1
+/etc/init.d/dbus stop         2>/dev/null || true
+sleep 1
+/etc/init.d/dbus start        2>/dev/null || true
 sleep 2
-/etc/init.d/avahi-daemon restart 2>/dev/null || true
+/etc/init.d/avahi-daemon start 2>/dev/null || true
+sleep 1
 log "✅ dbus/avahi-daemon 已重载"
 
-# ── U 盘检测 + 重型应用触发 ─────────────────────────────────
-USB_MOUNT=""
-for mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
-    mountpoint -q "$mp" 2>/dev/null && { USB_MOUNT="$mp"; break; }
-done
-
-if [ -n "$USB_MOUNT" ]; then
-    log "✅ 检测到 U 盘: $USB_MOUNT"
-    if [ ! -f "$USB_DONE" ]; then
-        log "🔄 调用重型应用安装..."
-        /usr/lib/install-extras/install-usb.sh "$USB_MOUNT"
-    else
-        log "ℹ️  重型应用已安装过，跳过"
-    fi
-else
-    log "ℹ️  无 U 盘，启用 zram 兜底..."
-    if modprobe zram num_devices=1 2>/dev/null && [ -e /sys/block/zram0/disksize ]; then
-        echo "256M" > /sys/block/zram0/disksize 2>/dev/null
-        mkswap  /dev/zram0 >/dev/null 2>&1
-        swapon  /dev/zram0 2>/dev/null \
-            && log "✅ zram 256MB 已启用（内存压缩）" \
+# ── zram 兜底（无 U 盘时补充内存）─────────────────────
+if ! grep -q zram /proc/swaps 2>/dev/null; then
+    if modprobe zram num_devices=1 2>/dev/null \
+    && [ -e /sys/block/zram0/disksize ]; then
+        echo "134217728" > /sys/block/zram0/disksize
+        mkswap /dev/zram0 >/dev/null 2>&1
+        swapon /dev/zram0 2>/dev/null \
+            && log "✅ zram 128MB 已启用" \
             || log "⚠️  zram 启用失败"
     else
-        log "⚠️  zram 不可用（内核不支持）"
+        log "ℹ️  zram 不可用（内核不支持）"
     fi
-    log "ℹ️  插入 U 盘后 block hotplug 将自动安装 Docker/AGH"
 fi
 
-# ── 收尾 ────────────────────────────────────────────────────
+# ── 刷新 LuCI ───────────────────────────────────────────
 rm -f /tmp/luci-indexcache* 2>/dev/null || true
 /etc/init.d/rpcd restart 2>/dev/null || true
-rm -f "$LOCK"
 
+# ── Phase 1 收尾 ────────────────────────────────────────
 if [ "$INSTALL_FAIL" -eq 0 ]; then
     touch "$DONE_FLAG"
+    rm -f "$STATE_DIR/phase1-failures"
     FLASH_FINAL=$(df /overlay 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
-    log "🎉 基础环境部署完成！Flash: ${FLASH_FINAL:-?}%"
+    log "🎉 基础环境部署完成！Flash 使用率: ${FLASH_FINAL:-?}%"
     [ "${FLASH_FINAL:-0}" -gt 85 ] && log "⚠️  Flash >85%，建议: apk cache clean"
-    log "💡 执行 '360v6-status' 查看完整状态"
 else
-    log "⚠️  $INSTALL_FAIL 组包失败，下次 WAN UP 自动重试"
+    echo $((__main_fail + 1)) > "$STATE_DIR/phase1-failures"
+    log "⚠️  $INSTALL_FAIL 组包失败（重试 $((__main_fail + 1))/3）"
+    exit 1
 fi
+
+# ── Phase 2：主动检测 U 盘（后台触发，避免 trap 冲突）──
+if [ ! -f "$USB_DONE" ]; then
+    log "⏳ 检测 U 盘（等待最长 60 秒）..."
+    USB_MOUNT=""
+    for __main_ui in $(seq 1 30); do
+        for __main_mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
+            mountpoint -q "$__main_mp" 2>/dev/null && { USB_MOUNT="$__main_mp"; break 2; }
+        done
+        sleep 2
+    done
+
+    if [ -n "$USB_MOUNT" ]; then
+        log "✅ 检测到 U 盘: $USB_MOUNT，后台触发重型应用安装..."
+        /usr/lib/install-extras/install-usb.sh "$USB_MOUNT" &
+    else
+        log "ℹ️  未检测到 U 盘，等待热插拔触发"
+        log "ℹ️  插入 U 盘后将自动安装 Docker / AdGuardHome"
+    fi
+fi
+
+log "💡 执行 '360v6-status' 查看完整状态"
 RUNEOF
 chmod +x /usr/lib/install-extras/run.sh
 
 # ══════════════════════════════════════════════════════════════
-# 模块 C：常驻哨兵 Hotplug
+# 模块 C：WAN hotplug（iface）✅ 变量防御 + 日志
 # ══════════════════════════════════════════════════════════════
-
-# 1. 网络哨兵：WAN 上线 → 检查基础环境
-cat > /etc/hotplug.d/iface/99-install-extras << 'EOF'
+cat > /etc/hotplug.d/iface/96-install-extras << 'IFACEEOF'
 #!/bin/sh
-[ "$ACTION" = "ifup" ] || exit 0
-[ -f /etc/install-extras-done ] && exit 0
-case "$INTERFACE" in
-    wan|wan6|pppoe-wan)
-        logger -t "hotplug" "🌐 WAN 上线，触发基础环境部署"
-        /usr/lib/install-extras/run.sh &
-        ;;
+# ✅ 融合点：变量防御 ${VAR:-} 防止未定义错误
+[ "${ACTION:-}" = "ifup" ] || exit 0
+case "${INTERFACE:-}" in
+    wan|wan6|pppoe-wan) ;;
+    *) exit 0 ;;
 esac
-EOF
+[ -f /etc/install-extras-done ] && exit 0
+logger -t "hotplug" "🌐 WAN 接口 ${INTERFACE:-?} 上线，触发基础环境部署"
+/usr/lib/install-extras/run.sh &
+IFACEEOF
+chmod +x /etc/hotplug.d/iface/96-install-extras
 
-# 2. 磁盘哨兵：U 盘插入 → 检查重型应用
-# ⚠️  v4.1 bug：固定 sleep 5 在 U 盘挂载慢时会导致挂载点未就绪。
-#    改为 mountpoint -q 轮询（最长 30 秒），确认挂载后再触发。
-cat > /etc/hotplug.d/block/99-usb-extras << 'EOF'
+# ══════════════════════════════════════════════════════════════
+# 模块 D：U 盘 hotplug（block）✅ 变量防御 + 日志
+# ══════════════════════════════════════════════════════════════
+cat > /etc/hotplug.d/block/96-install-usb << 'BLOCKEOF'
 #!/bin/sh
-[ "$ACTION" = "add" ]           || exit 0
+# ✅ 融合点：变量防御 ${VAR:-} 防止未定义错误
+[ "${ACTION:-}" = "add" ] || exit 0
 [ -f /etc/install-usb-done ]    && exit 0
 [ -f /etc/install-extras-done ] || exit 0
 
-# 等待挂载点就绪（最长 30 秒）
+logger -t "hotplug" "💾 block add 事件: DEVNAME=${DEVNAME:-?}"
+
 MP=""
-for i in $(seq 1 15); do
-    for mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
-        mountpoint -q "$mp" 2>/dev/null && { MP="$mp"; break 2; }
+for __blk_i in $(seq 1 15); do
+    for __blk_mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
+        mountpoint -q "$__blk_mp" 2>/dev/null && { MP="$__blk_mp"; break 2; }
     done
     sleep 2
 done
 
 if [ -z "$MP" ]; then
-    logger -t "hotplug" "⚠️  U 盘插入但挂载点未就绪，跳过"
+    logger -t "hotplug" "⚠️  U 盘插入但挂载点未就绪（DEVNAME=${DEVNAME:-?}），跳过"
     exit 1
 fi
 
 logger -t "hotplug" "💾 U 盘已挂载: $MP，触发重型应用部署"
 /usr/lib/install-extras/install-usb.sh "$MP" &
-EOF
-
-chmod +x /etc/hotplug.d/iface/99-install-extras
-chmod +x /etc/hotplug.d/block/99-usb-extras
+BLOCKEOF
+chmod +x /etc/hotplug.d/block/96-install-usb
 
 # ══════════════════════════════════════════════════════════════
-# 首次后台执行
+# 完成
 # ══════════════════════════════════════════════════════════════
-/usr/lib/install-extras/run.sh &
-
-logger -t "install-extras" "✅ Final v4.2 哨兵系统已就绪"
+logger -t "install-extras" "✅ v1 Fusion Edition 哨兵系统已就绪"
 logger -t "install-extras" "💡 执行 '360v6-status' 查看部署状态"
 exit 0
