@@ -1,7 +1,7 @@
 #!/bin/sh
-# 96-install-extras [Final v3]
+# 96-install-extras [Final v3.1]
 # 适用：128M Flash + 512M RAM（360 V6 / 小米 CR660x 等）
-# 改进：Flash 三档保护 / Swap 自动创建 / I/O 优化 / avahi 修复 / AGH 迁移保护
+# 改进：Flash 三档保护 / Swap 自动创建 / I/O 优化 / avahi 修复 / AGH 迁移保护 / resolv.conf 恢复
 
 DONE_FLAG="/etc/install-extras-done"
 [ -f "$DONE_FLAG" ] && exit 0
@@ -20,7 +20,7 @@ log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
 [ -f "$LOCK" ]      && exit 0
 touch "$LOCK"
 
-log "▶ Final v3 启动 | 128M Flash 保护模式"
+log "▶ Final v3.1 启动 | 128M Flash 保护模式"
 
 # ══════════════════════════════════════════════════════════════
 # 1. 清理无效 video 源
@@ -44,8 +44,10 @@ if [ "$NETWORK_OK" -eq 0 ]; then
     rm -f "$LOCK"; exit 1
 fi
 
+# 临时注入公共 DNS，绕过 SmartDNS 启动时序问题
+# ⚠️ 仅安装期间使用，完成后会恢复交还 dnsmasq
 printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
-log "✅ 网络与 DNS 就绪"
+log "✅ 网络就绪，临时 DNS 已注入"
 
 # ══════════════════════════════════════════════════════════════
 # 3. 检测 U 盘（等待最长 30 秒）
@@ -134,7 +136,7 @@ fi
 log "✅ apk update 成功"
 
 # ══════════════════════════════════════════════════════════════
-# 7. 安装辅助函数（带失败计数，正确捕获退出码）
+# 7. 安装辅助函数（带失败计数）
 # ══════════════════════════════════════════════════════════════
 INSTALL_FAIL=0
 install_pkg() {
@@ -277,7 +279,15 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════
-# 12. 刷新 LuCI 缓存 & 清理触发器
+# 12. 恢复 resolv.conf，交还 dnsmasq 管理
+#     防止公共 DNS 绕过 SmartDNS 永久生效
+# ══════════════════════════════════════════════════════════════
+printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
+/etc/init.d/dnsmasq restart 2>/dev/null || true
+log "✅ resolv.conf 已恢复，DNS 交还 dnsmasq / SmartDNS"
+
+# ══════════════════════════════════════════════════════════════
+# 13. 刷新 LuCI 缓存 & 清理触发器
 # ══════════════════════════════════════════════════════════════
 rm -f /tmp/luci-indexcache* 2>/dev/null || true
 /etc/init.d/rpcd restart 2>/dev/null || true
@@ -285,12 +295,12 @@ rm -f /etc/hotplug.d/iface/99-install-extras
 rm -f "$LOCK"
 
 # ══════════════════════════════════════════════════════════════
-# 13. 完成判断 & 失败重试注册
+# 14. 完成判断 & 失败重试注册
 # ══════════════════════════════════════════════════════════════
 if [ "$INSTALL_FAIL" -eq 0 ]; then
     FLASH_FINAL=$(df /overlay 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
     touch "$DONE_FLAG"
-    log "🎉 Final v3 部署完成！Flash 使用率: ${FLASH_FINAL:-?}%"
+    log "🎉 Final v3.1 部署完成！Flash 使用率: ${FLASH_FINAL:-?}%"
     [ "${FLASH_FINAL:-0}" -gt 85 ] && \
         log "⚠️  Flash >85%，建议执行: apk cache clean"
 else
@@ -320,5 +330,5 @@ case "$INTERFACE" in wan|wan6|pppoe-wan) ;; *) exit 0 ;; esac
 HOTEOF
 chmod +x /etc/hotplug.d/iface/99-install-extras
 
-logger -t "install-extras" "✅ Final v3 已安装，等待 WAN UP 触发"
+logger -t "install-extras" "✅ Final v3.1 已安装，等待 WAN UP 触发"
 exit 0
