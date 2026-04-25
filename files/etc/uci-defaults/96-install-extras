@@ -1,360 +1,492 @@
 #!/bin/sh
-# 96-install-extras [v6.2]
+# 96-install-extras [v7.0]
 # 适用：360 V6 / IPQ6000 (ImmortalWrt / ash)
 #
-# v6.2 修复：
-#   - 新增 --force 参数：hotplug / 手动触发时自动清零失败计数，不被 3/3 拦截
-#   - 自愈模式（--self-heal）仍受失败计数限制
-#   - 360v6-status 手动重跑提示更新为正确命令（无需手动删 phase2-failures）
+# 架构：双阶段 + 双哨兵 + 自愈定时任务
+#   Phase 1 (run.sh)        : 基础工具 + Samba，WAN 上线触发
+#   Phase 2 (install-usb.sh): Docker + AdGuardHome，U 盘就绪触发
+#
+# 安装策略（基于实测）：
+#   docker/dockerd/containerd : wget 下载 static tgz（apk 源无此包）
+#   adguardhome               : wget 下载 tgz（apk 源无此包）
+#   luci-app-dockerman        : apk（源里有）
+#   luci-app-adguardhome      : apk（源里有）
+#
+# 参数：
+#   --force     : 清零失败计数，无条件重试（hotplug / 手动）
+#   --self-heal : 受失败计数限制（cron 自愈）
 
 DONE_FLAG="/etc/install-extras-done"
 USB_DONE="/etc/install-usb-done"
 STATE_DIR="/etc/install-state"
 MOUNT_FILE="/etc/install-usb-mount"
 
-DOCKER_VER="29.3.0"
-AGH_VER="v0.107.74"
-DOCKER_URL="https://download.docker.com/linux/static/stable/aarch64/docker-${DOCKER_VER}.tgz"
-AGH_URL="https://static.adguard.com/adguardhome/release/AdGuardHome_linux_arm64.tar.gz"
-
 mkdir -p "$STATE_DIR" /usr/lib/install-extras /usr/bin \
          /etc/hotplug.d/iface /etc/hotplug.d/block \
-         /etc/dbus-1 /etc/profile.d /etc/crontabs
-
-_is_mounted() { grep -q "^[^ ]* $1 " /proc/mounts 2>/dev/null; }
+         /etc/dbus-1
 
 # ====================================================================
 # 模块 0：360v6-status
 # ====================================================================
 cat > /usr/bin/360v6-status << 'STATUSEOF'
 #!/bin/sh
-_is_mounted() { grep -q "^[^ ]* $1 " /proc/mounts 2>/dev/null; }
 STATE_DIR="/etc/install-state"
+_is_mounted() { grep -q "^[^ ]* $1 " /proc/mounts 2>/dev/null; }
 
 echo "=== 360 V6 状态 @ $(date '+%Y-%m-%d %H:%M:%S') ==="
 echo ""
-[ -f /etc/install-extras-done ] && echo "[OK] 基础环境：完成" || echo "[..] 基础环境：待触发"
+[ -f /etc/install-extras-done ] \
+    && echo "[OK] 基础环境：完成" \
+    || echo "[..] 基础环境：待触发"
 p1=$(cat "$STATE_DIR/phase1-failures" 2>/dev/null || echo 0)
 [ "$p1" -gt 0 ] && echo "     失败次数: $p1/3"
-[ -f /etc/install-usb-done ] && echo "[OK] 重型应用：完成" || echo "[..] 重型应用：待 U 盘"
+
+[ -f /etc/install-usb-done ] \
+    && echo "[OK] 重型应用：完成" \
+    || echo "[..] 重型应用：待 U 盘"
 p2=$(cat "$STATE_DIR/phase2-failures" 2>/dev/null || echo 0)
 [ "$p2" -gt 0 ] && echo "     失败次数: $p2/3"
+
 echo ""
-df -h /overlay 2>/dev/null | awk 'NR==2{print "Flash : "$3" / "$2" ("$5")"}'
-free 2>/dev/null | awk '/Mem:/{printf "Mem   : %dMB used / %dMB total\n",$3/1024,$2/1024}'
+df -h /overlay 2>/dev/null \
+    | awk 'NR==2{print "Flash : "$3" / "$2" ("$5")"}'
+free 2>/dev/null \
+    | awk '/Mem:/{printf "Mem   : %dMB used / %dMB total\n",$3/1024,$2/1024}'
 echo ""
+
 USB_MP=""
 for mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
-    _is_mounted "$mp" && { echo "USB   : $mp (已挂载)"; USB_MP="$mp"; }
+    _is_mounted "$mp" && { echo "USB   : $mp (已挂载)"; USB_MP="$mp"; break; }
 done
 [ -z "$USB_MP" ] && echo "USB   : 未检测到"
-[ -f /etc/install-usb-mount ] && echo "PATH  : $(cat /etc/install-usb-mount)"
+[ -f /etc/install-usb-mount ] \
+    && echo "PATH  : $(cat /etc/install-usb-mount)"
 grep -q swapfile /proc/swaps 2>/dev/null && echo "Swap  : swapfile 已激活"
+grep -q zram     /proc/swaps 2>/dev/null && echo "Swap  : zram 已激活"
+
 echo ""
-docker info >/dev/null 2>&1       && echo "[OK] Docker      : 运行中" || echo "[--] Docker      : 未启动"
-pgrep AdGuardHome >/dev/null 2>&1 && echo "[OK] AdGuardHome : 运行中" || echo "[--] AdGuardHome : 未启动"
+docker info >/dev/null 2>&1 \
+    && echo "[OK] Docker      : 运行中" \
+    || echo "[--] Docker      : 未启动"
+pgrep AdGuardHome >/dev/null 2>&1 \
+    && echo "[OK] AdGuardHome : 运行中" \
+    || echo "[--] AdGuardHome : 未启动"
+
 echo ""
 echo "手动重跑基础: rm -f /etc/install-extras-done $STATE_DIR/phase1-failures && /usr/lib/install-extras/run.sh"
-# v6.2：手动重跑重型应用只需删 done 标志，--force 会自动清零失败计数
-echo "手动重跑重型: rm -f /etc/install-usb-done && /usr/lib/install-extras/install-usb.sh --force"
+echo "手动重跑重型: rm -f /etc/install-usb-done   && /usr/lib/install-extras/install-usb.sh --force"
 STATUSEOF
 chmod +x /usr/bin/360v6-status
 
 # ====================================================================
-# 模块 A：install-usb.sh
+# 模块 A：install-usb.sh（Phase 2）
+# 单引号 heredoc，所有变量运行时展开
 # ====================================================================
-cat > /usr/lib/install-extras/install-usb.sh << USBEOF
+cat > /usr/lib/install-extras/install-usb.sh << 'USBEOF'
 #!/bin/sh
-LOG_TAG="usb"
+LOG_TAG="usb-extras"
 USB_DONE="/etc/install-usb-done"
 LOCK="/tmp/install-usb.lock"
 STATE_DIR="/etc/install-state"
 MOUNT_FILE="/etc/install-usb-mount"
 
-DOCKER_VER="${DOCKER_VER}"
-AGH_VER="${AGH_VER}"
-DOCKER_URL="${DOCKER_URL}"
-AGH_URL="${AGH_URL}"
+# Docker static 包候选版本（从新到旧，运行时探测最新可用）
+DOCKER_VER_LIST="28.1.1 28.1.0 28.0.4 28.0.3 27.5.1 27.5.0"
+AGH_URL="https://static.adguard.com/adguardhome/release/AdGuardHome_linux_arm64.tar.gz"
 
-log() { echo "[\$(date '+%H:%M:%S')] \$1" | logger -t "\$LOG_TAG"; }
-_is_mounted() { grep -q "^[^ ]* \$1 " /proc/mounts 2>/dev/null; }
+log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
+_is_mounted() { grep -q "^[^ ]* $1 " /proc/mounts 2>/dev/null; }
 
-mkdir -p "\$STATE_DIR"
+mkdir -p "$STATE_DIR"
 
-# ── 解析参数 ─────────────────────────────────────────────────────
-# --self-heal : cron 自愈调用，受失败计数限制
-# --force     : hotplug / 手动触发，清零失败计数，不受限制
-# 第一个非 -- 参数视为挂载点
+# ── 解析参数 ─────────────────────────────────────────────
 __self_heal=0
 __force=0
 __mp_arg=""
-for _arg in "\$@"; do
-    case "\$_arg" in
+for _arg in "$@"; do
+    case "$_arg" in
         --self-heal) __self_heal=1 ;;
         --force)     __force=1 ;;
         --*)         ;;
-        *)           [ -z "\$__mp_arg" ] && __mp_arg="\$_arg" ;;
+        *)           [ -z "$__mp_arg" ] && __mp_arg="$_arg" ;;
     esac
 done
 
-# ── 自愈模式 ─────────────────────────────────────────────────────
-if [ "\$__self_heal" -eq 1 ]; then
-    [ -f "\$USB_DONE" ] && exit 0
-    __sf=\$(cat "\$STATE_DIR/phase2-failures" 2>/dev/null || echo 0)
-    [ "\${__sf:-0}" -ge 3 ] && exit 0
-    if [ -f "\$LOCK" ]; then
-        _pid=\$(cat "\$LOCK" 2>/dev/null)
-        kill -0 "\$_pid" 2>/dev/null && exit 0
-        log "🔧 清理残留锁 (旧pid=\$_pid)"; rm -f "\$LOCK"
+# ── 自愈模式（cron 调用）────────────────────────────────
+if [ "$__self_heal" -eq 1 ]; then
+    [ -f "$USB_DONE" ] && exit 0
+    __sf=$(cat "$STATE_DIR/phase2-failures" 2>/dev/null || echo 0)
+    [ "${__sf:-0}" -ge 3 ] && exit 0
+    if [ -f "$LOCK" ]; then
+        _pid=$(cat "$LOCK" 2>/dev/null)
+        kill -0 "$_pid" 2>/dev/null && exit 0
+        log "🔧 清理残留锁 (旧pid=$_pid)"
+        rm -f "$LOCK"
     fi
     for _mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
-        _is_mounted "\$_mp" && {
-            log "🔧 自愈触发: \$_mp"
-            # 自愈用普通模式调用（不加 --force，保留失败计数保护）
-            /usr/lib/install-extras/install-usb.sh "\$_mp" &
+        _is_mounted "$_mp" && {
+            log "🔧 自愈触发: $_mp"
+            /usr/lib/install-extras/install-usb.sh "$_mp" &
             exit 0
         }
     done
     exit 0
 fi
 
-# ── 幂等检查 ─────────────────────────────────────────────────────
-[ -f "\$USB_DONE" ] && { log "ℹ️ 已完成，跳过"; exit 0; }
+# ── 幂等检查 ─────────────────────────────────────────────
+[ -f "$USB_DONE" ] && { log "ℹ️  已完成，跳过"; exit 0; }
 
-# ── 先设 trap，再写锁 ────────────────────────────────────────────
-trap 'rm -f "\$LOCK"' EXIT INT TERM
-if [ -f "\$LOCK" ]; then
-    _pid=\$(cat "\$LOCK" 2>/dev/null)
-    kill -0 "\$_pid" 2>/dev/null && { log "⚠️ 运行中 (pid=\$_pid)，跳过"; exit 0; }
-    log "🔧 清理残留锁 (旧pid=\$_pid)"; rm -f "\$LOCK"
+# ── PID 锁 ───────────────────────────────────────────────
+trap 'rm -f "$LOCK"' EXIT INT TERM
+if [ -f "$LOCK" ]; then
+    _pid=$(cat "$LOCK" 2>/dev/null)
+    kill -0 "$_pid" 2>/dev/null && {
+        log "⚠️  运行中 (pid=$_pid)，跳过"; exit 0
+    }
+    log "🔧 清理残留锁 (旧pid=$_pid)"
+    rm -f "$LOCK"
 fi
-echo \$\$ > "\$LOCK"
+echo $$ > "$LOCK"
 
-# ── v6.2：失败计数处理 ───────────────────────────────────────────
-# --force（hotplug/手动）：清零计数，无条件重试
-# 普通模式（自愈间接调用）：检查上限
-if [ "\$__force" -eq 1 ]; then
-    rm -f "\$STATE_DIR/phase2-failures"
+# ── 失败计数处理 ─────────────────────────────────────────
+if [ "$__force" -eq 1 ]; then
+    rm -f "$STATE_DIR/phase2-failures"
     __fail=0
     log "🔄 --force 模式：已清零失败计数"
 else
-    __fail=\$(cat "\$STATE_DIR/phase2-failures" 2>/dev/null || echo 0)
-    if [ "\${__fail:-0}" -ge 3 ]; then
-        log "❌ 失败次数过多 (\${__fail}/3)，停止自动重试"
-        log "💡 手动重跑: rm -f /etc/install-usb-done && /usr/lib/install-extras/install-usb.sh --force"
+    __fail=$(cat "$STATE_DIR/phase2-failures" 2>/dev/null || echo 0)
+    if [ "${__fail:-0}" -ge 3 ]; then
+        log "❌ 失败次数过多（${__fail}/3），停止自动重试"
+        log "💡 手动重跑: rm -f /etc/install-usb-done && $0 --force"
         exit 1
     fi
 fi
 
-# ── 确定 U 盘挂载点 ──────────────────────────────────────────────
-USB_MOUNT="\$__mp_arg"
-[ -n "\$USB_MOUNT" ] && ! _is_mounted "\$USB_MOUNT" && {
-    log "⚠️ 参数 \$USB_MOUNT 未挂载，重新扫描"; USB_MOUNT=""
+# ── 确定 U 盘挂载点 ──────────────────────────────────────
+USB_MOUNT="$__mp_arg"
+[ -n "$USB_MOUNT" ] && ! _is_mounted "$USB_MOUNT" && {
+    log "⚠️  参数 $USB_MOUNT 未挂载，重新扫描"
+    USB_MOUNT=""
 }
-if [ -z "\$USB_MOUNT" ]; then
+if [ -z "$USB_MOUNT" ]; then
     for _mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
-        _is_mounted "\$_mp" && { USB_MOUNT="\$_mp"; break; }
+        _is_mounted "$_mp" && { USB_MOUNT="$_mp"; break; }
     done
 fi
-[ -z "\$USB_MOUNT" ] && \
-    USB_MOUNT=\$(grep -E '^/dev/sd[a-z][0-9]* ' /proc/mounts 2>/dev/null | head -1 | awk '{print \$2}')
-if [ -z "\$USB_MOUNT" ]; then
+[ -z "$USB_MOUNT" ] && \
+    USB_MOUNT=$(grep -E '^/dev/sd[a-z][0-9]* ' /proc/mounts 2>/dev/null \
+                | head -1 | awk '{print $2}')
+if [ -z "$USB_MOUNT" ]; then
     log "❌ 未找到 U 盘挂载点"
-    echo \$((\$__fail + 1)) > "\$STATE_DIR/phase2-failures"; exit 1
+    echo $((__fail + 1)) > "$STATE_DIR/phase2-failures"
+    exit 1
 fi
-echo "\$USB_MOUNT" > "\$MOUNT_FILE"
-log "▶ 重型应用部署 | U盘: \$USB_MOUNT | Docker:\$DOCKER_VER AGH:\$AGH_VER"
+echo "$USB_MOUNT" > "$MOUNT_FILE"
+log "▶ 重型应用部署启动 | U 盘: $USB_MOUNT"
 
-# ── 下载目录 / TMPDIR ────────────────────────────────────────────
-DL_DIR="\$USB_MOUNT/.downloads"
-export TMPDIR="\$USB_MOUNT/.tmp"
-mkdir -p "\$DL_DIR" "\$TMPDIR"
-
-# ── 空间预检（≥ 1GB）─────────────────────────────────────────────
-_avail=\$(df -k "\$USB_MOUNT" 2>/dev/null | awk 'NR==2{print \$4}')
-if [ "\${_avail:-0}" -lt 1048576 ]; then
-    log "⚠️ U 盘空间不足 (\${_avail:-0}KB < 1GB)"
-    echo \$((\$__fail + 1)) > "\$STATE_DIR/phase2-failures"; exit 1
+# ── U 盘空间预检（≥ 1GB）────────────────────────────────
+_avail=$(df -k "$USB_MOUNT" 2>/dev/null | awk 'NR==2{print $4}')
+if [ "${_avail:-0}" -lt 1048576 ]; then
+    log "⚠️  U 盘空间不足（${_avail:-0}KB < 1GB）"
+    echo $((__fail + 1)) > "$STATE_DIR/phase2-failures"
+    exit 1
 fi
 
-# ── DNS 保护 ─────────────────────────────────────────────────────
-__dns_old=\$(cat /etc/resolv.conf 2>/dev/null)
-[ -z "\$__dns_old" ] && __dns_old="nameserver 127.0.0.1"
+# ── DNS 保护 ─────────────────────────────────────────────
+__dns_old=$(cat /etc/resolv.conf 2>/dev/null)
+[ -z "$__dns_old" ] && __dns_old="nameserver 127.0.0.1"
 printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
-trap 'rm -f "\$LOCK"; printf "%s\n" "\$__dns_old" > /etc/resolv.conf' EXIT INT TERM
+trap 'rm -f "$LOCK"; printf "%s\n" "$__dns_old" > /etc/resolv.conf' EXIT INT TERM
+log "✅ 临时 DNS 已注入"
 
-echo "10" > /proc/sys/vm/swappiness 2>/dev/null
-
-# ── Swap ─────────────────────────────────────────────────────────
-SWAPFILE="\$USB_MOUNT/swapfile"
-if ! grep -q swapfile /proc/swaps 2>/dev/null; then
-    if [ ! -f "\$SWAPFILE" ]; then
-        log "⏳ 创建 256MB Swap..."
-        dd if=/dev/zero of="\${SWAPFILE}.tmp" bs=1M count=256 2>/dev/null && {
-            mv "\${SWAPFILE}.tmp" "\$SWAPFILE"; sync
-            chmod 600 "\$SWAPFILE"; mkswap "\$SWAPFILE" >/dev/null 2>&1
-            log "✅ Swap 文件已创建"
-        } || rm -f "\${SWAPFILE}.tmp"
+# ── I/O 优化 + 内存参数 ──────────────────────────────────
+_udev=$(mount | grep " $USB_MOUNT " | awk '{print $1}' \
+        | sed 's|/dev/||;s|[0-9]*$||')
+_sched="/sys/block/${_udev}/queue/scheduler"
+if [ -n "$_udev" ] && [ -f "$_sched" ]; then
+    if grep -q "mq-deadline" "$_sched" 2>/dev/null; then
+        echo "mq-deadline" > "$_sched" 2>/dev/null
+    else
+        echo "deadline" > "$_sched" 2>/dev/null
     fi
-    [ -f "\$SWAPFILE" ] && swapon "\$SWAPFILE" 2>/dev/null && {
-        grep -qF "\$SWAPFILE" /etc/fstab 2>/dev/null || echo "\$SWAPFILE none swap sw 0 0" >> /etc/fstab
-        log "✅ Swap 已激活"
-    }
-else
-    log "ℹ️ Swap 已激活，跳过"
+    log "⚡ I/O 调度器: $(grep -oE '\[[^]]+\]' "$_sched" 2>/dev/null | tr -d '[]')"
+fi
+echo "10"    > /proc/sys/vm/swappiness      2>/dev/null
+echo "16384" > /proc/sys/vm/min_free_kbytes 2>/dev/null
+log "⚡ 内存参数已优化"
+
+# ── Swap（原子写入 + fstab 持久化）─────────────────────
+SWAPFILE="$USB_MOUNT/swapfile"
+if ! grep -q swapfile /proc/swaps 2>/dev/null; then
+    if [ ! -f "$SWAPFILE" ]; then
+        log "⏳ 创建 256MB Swap（原子写入）..."
+        if dd if=/dev/zero of="${SWAPFILE}.tmp" bs=1M count=256 2>/dev/null; then
+            mv "${SWAPFILE}.tmp" "$SWAPFILE"
+            sync
+            chmod 600 "$SWAPFILE"
+            mkswap "$SWAPFILE" >/dev/null 2>&1
+            log "✅ Swap 文件已创建"
+        else
+            rm -f "${SWAPFILE}.tmp"
+            log "⚠️  Swap 创建失败"
+        fi
+    fi
+    if [ -f "$SWAPFILE" ]; then
+        swapon "$SWAPFILE" 2>/dev/null \
+            && log "✅ Swap 已激活" \
+            || log "ℹ️  Swap 激活失败（可能已挂载）"
+        grep -qF "$SWAPFILE" /etc/fstab 2>/dev/null \
+            || echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
+    fi
 fi
 
-# ── 下载函数（失败重试 3 次）────────────────────────────────────
+# ── 下载函数（失败重试 3 次）────────────────────────────
 _download() {
-    _url="\$1"; _out="\$2"; _desc="\$3"
-    log "⬇️ 下载 \$_desc ..."
+    _url="$1"; _out="$2"; _desc="$3"
+    log "⬇️  下载 $_desc ..."
     _i=1
-    while [ "\$_i" -le 3 ]; do
-        wget -q --timeout=120 --tries=1 -O "\${_out}.tmp" "\$_url" 2>/dev/null && {
-            mv "\${_out}.tmp" "\$_out"
-            log "✅ 下载完成: \$_desc"
+    while [ "$_i" -le 3 ]; do
+        wget -q --timeout=120 --tries=1 -O "${_out}.tmp" "$_url" 2>/dev/null && {
+            mv "${_out}.tmp" "$_out"
+            log "✅ 下载完成: $_desc"
             return 0
         }
-        log "⚠️ 下载失败 (\$_i/3): \$_desc"
-        rm -f "\${_out}.tmp"
-        _i=\$((\$_i + 1))
+        log "⚠️  下载失败 ($_i/3): $_desc"
+        rm -f "${_out}.tmp"
+        _i=$((_i + 1))
         sleep 5
     done
-    log "❌ 下载失败: \$_desc"
+    log "❌ 下载失败: $_desc"
     return 1
 }
 
-# ====================================================================
-# Docker
-# ====================================================================
-log "📦 部署 Docker \$DOCKER_VER ..."
-DD="\$USB_MOUNT/docker-data"
-DB="\$USB_MOUNT/docker-bin"
-mkdir -p "\$DD" "\$DB" /etc/docker
+# ── 探测最新可用 Docker 版本 ─────────────────────────────
+_get_docker_ver() {
+    for _ver in $DOCKER_VER_LIST; do
+        wget -q --spider \
+            "https://download.docker.com/linux/static/stable/aarch64/docker-${_ver}.tgz" \
+            2>/dev/null && echo "$_ver" && return
+    done
+    # 兜底：返回列表第一个（最新）
+    echo "$DOCKER_VER_LIST" | awk '{print $1}'
+}
 
-__dok=0
-DOCKER_TGZ="\$DL_DIR/docker-\${DOCKER_VER}.tgz"
-[ ! -f "\$DOCKER_TGZ" ] && _download "\$DOCKER_URL" "\$DOCKER_TGZ" "Docker \$DOCKER_VER"
+# ── 下载目录（缓存，重试不重复下载）────────────────────
+DL_DIR="$USB_MOUNT/.downloads"
+mkdir -p "$DL_DIR"
 
-if [ -f "\$DOCKER_TGZ" ]; then
+# ── Flash 空间检测（供 LuCI 安装决策）───────────────────
+FLASH_FREE=$(df /overlay 2>/dev/null | awk 'NR==2{print $4}')
+
+# ====================================================================
+# Docker 部署
+# ====================================================================
+DOCKER_FAIL=0
+log "📦 探测最新 Docker 版本..."
+DOCKER_VER=$(_get_docker_ver)
+log "📦 部署 Docker $DOCKER_VER ..."
+
+DOCKER_TGZ="$DL_DIR/docker-${DOCKER_VER}.tgz"
+DOCKER_URL="https://download.docker.com/linux/static/stable/aarch64/docker-${DOCKER_VER}.tgz"
+DOCKER_BIN="$USB_MOUNT/docker-bin"
+DOCKER_DATA="$USB_MOUNT/docker-data"
+mkdir -p "$DOCKER_BIN" "$DOCKER_DATA" /etc/docker
+
+if [ ! -f "$DOCKER_TGZ" ]; then
+    _download "$DOCKER_URL" "$DOCKER_TGZ" "Docker $DOCKER_VER" || {
+        log "❌ Docker 下载失败"
+        DOCKER_FAIL=1
+    }
+fi
+
+if [ "$DOCKER_FAIL" -eq 0 ] && [ -f "$DOCKER_TGZ" ]; then
     log "📂 解压 Docker..."
-    tar -xzf "\$DOCKER_TGZ" -C "\$DB" --strip-components=1 2>/dev/null && {
-        mkdir -p /overlay/upper/usr/bin
-        for _b in docker dockerd containerd containerd-shim-runc-v2 ctr runc; do
-            [ -f "\$DB/\$_b" ] && ln -sf "\$DB/\$_b" "/overlay/upper/usr/bin/\$_b" 2>/dev/null || true
-        done
+    tar -xzf "$DOCKER_TGZ" -C "$DOCKER_BIN" --strip-components=1 2>/dev/null || {
+        log "❌ Docker 解压失败"
+        DOCKER_FAIL=1
+    }
+fi
 
-        cat > /etc/docker/daemon.json << DJSON
+if [ "$DOCKER_FAIL" -eq 0 ]; then
+    # 软链所有二进制到 /usr/bin
+    for _b in docker dockerd containerd containerd-shim-runc-v2 ctr runc; do
+        [ -f "$DOCKER_BIN/$_b" ] && \
+            ln -sf "$DOCKER_BIN/$_b" "/usr/bin/$_b" 2>/dev/null || true
+    done
+
+    # daemon.json
+    cat > /etc/docker/daemon.json << DOCKEREOF
 {
-  "data-root": "\$DD",
+  "data-root": "$DOCKER_DATA",
   "storage-driver": "overlay2",
   "log-driver": "json-file",
   "log-opts": {"max-size": "5m", "max-file": "2"}
 }
-DJSON
+DOCKEREOF
 
-        cat > /etc/init.d/dockerd << 'DINIT'
+    # init.d 脚本（读 MOUNT_FILE 获取路径，重启后仍有效）
+    cat > /etc/init.d/dockerd << 'DINITEOF'
 #!/bin/sh /etc/rc.common
 START=99; STOP=10; USE_PROCD=1
 start_service() {
     [ -f /etc/install-usb-done ] || return 0
-    M=$(cat /etc/install-usb-mount 2>/dev/null)
-    [ -n "$M" ] && [ -f "$M/docker-bin/dockerd" ] || return 1
+    MP=$(cat /etc/install-usb-mount 2>/dev/null)
+    [ -n "$MP" ] && [ -f "$MP/docker-bin/dockerd" ] || return 1
+    mountpoint -q /sys/fs/cgroup || \
+        mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
     procd_open_instance
-    procd_set_param command "$M/docker-bin/dockerd" --config-file /etc/docker/daemon.json
+    procd_set_param command "$MP/docker-bin/dockerd" \
+        --config-file /etc/docker/daemon.json
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_set_param respawn 3600 5 3
     procd_close_instance
 }
-stop_service() { pkill dockerd 2>/dev/null; pkill containerd 2>/dev/null; return 0; }
-DINIT
-        chmod +x /etc/init.d/dockerd
-        /etc/init.d/dockerd enable 2>&1 | logger -t "\$LOG_TAG"
-        /etc/init.d/dockerd start  2>&1 | logger -t "\$LOG_TAG"
-        _i=1
-        while [ "\$_i" -le 15 ]; do
-            docker info >/dev/null 2>&1 && { __dok=1; break; }
-            sleep 2; _i=\$((\$_i + 1))
-        done
-        [ "\$__dok" -eq 1 ] \
-            && log "✅ Docker \$DOCKER_VER 已启动" \
-            || log "⚠️ Docker 启动超时（稍后可能就绪）"
-    } || log "❌ Docker 解压失败"
+stop_service() {
+    pkill dockerd    2>/dev/null || true
+    pkill containerd 2>/dev/null || true
+}
+DINITEOF
+    chmod +x /etc/init.d/dockerd
+    /etc/init.d/dockerd enable 2>/dev/null || true
+    /etc/init.d/dockerd start  2>/dev/null || true
+
+    # 等待 dockerd 就绪（最长 30 秒）
+    _i=1
+    while [ "$_i" -le 15 ]; do
+        docker info >/dev/null 2>&1 && break
+        sleep 2; _i=$((_i + 1))
+    done
+    if docker info >/dev/null 2>&1; then
+        log "✅ Docker $DOCKER_VER 已启动 | data: $DOCKER_DATA"
+    else
+        log "⚠️  Docker 启动超时（稍后可能自动就绪）"
+    fi
+
+    # luci-app-dockerman（apk 源有）
+    if [ "${FLASH_FREE:-99999}" -ge 25000 ]; then
+        _tmp=$(mktemp /tmp/apk-out.XXXXXX)
+        apk add --no-cache luci-app-dockerman luci-i18n-dockerman-zh-cn \
+            > "$_tmp" 2>&1
+        cat "$_tmp" | logger -t "$LOG_TAG"
+        rm -f "$_tmp"
+        log "✅ luci-app-dockerman 已安装"
+    else
+        log "ℹ️  Flash <25MB，跳过 luci-app-dockerman"
+    fi
 fi
 
 # ====================================================================
-# AdGuardHome
+# AdGuardHome 部署
 # ====================================================================
-log "📦 部署 AdGuardHome \$AGH_VER ..."
-AB="\$USB_MOUNT/adguardhome-bin"
-AD="\$USB_MOUNT/adguardhome-data"
-AC="\$USB_MOUNT/adguardhome-config"
-mkdir -p "\$AB" "\$AD" "\$AC"
+AGH_FAIL=0
+log "📦 部署 AdGuardHome ..."
 
-__aok=0
-AGH_TGZ="\$DL_DIR/AdGuardHome_linux_arm64.tar.gz"
-[ ! -f "\$AGH_TGZ" ] && _download "\$AGH_URL" "\$AGH_TGZ" "AdGuardHome \$AGH_VER"
+AGH_TGZ="$DL_DIR/AdGuardHome_linux_arm64.tar.gz"
+AGH_BIN="$USB_MOUNT/adguardhome-bin"
+AGH_DATA="$USB_MOUNT/AdGuardHome/data"
+AGH_CONF="$USB_MOUNT/AdGuardHome/config"
+mkdir -p "$AGH_BIN" "$AGH_DATA" "$AGH_CONF"
 
-if [ -f "\$AGH_TGZ" ]; then
+if [ ! -f "$AGH_TGZ" ]; then
+    _download "$AGH_URL" "$AGH_TGZ" "AdGuardHome" || {
+        log "❌ AdGuardHome 下载失败"
+        AGH_FAIL=1
+    }
+fi
+
+if [ "$AGH_FAIL" -eq 0 ] && [ -f "$AGH_TGZ" ]; then
     log "📂 解压 AdGuardHome..."
-    tar -xzf "\$AGH_TGZ" -C "\$AB" --strip-components=1 2>/dev/null && \
-    [ -f "\$AB/AdGuardHome" ] && {
-        chmod +x "\$AB/AdGuardHome"
-        mkdir -p /overlay/upper/usr/bin
-        ln -sf "\$AB/AdGuardHome" "/overlay/upper/usr/bin/AdGuardHome" 2>/dev/null || true
+    tar -xzf "$AGH_TGZ" -C "$AGH_BIN" --strip-components=2 2>/dev/null
+    if [ -f "$AGH_BIN/AdGuardHome" ]; then
+        chmod +x "$AGH_BIN/AdGuardHome"
+        ln -sf "$AGH_BIN/AdGuardHome" "/usr/bin/AdGuardHome" 2>/dev/null || true
+    else
+        log "❌ AdGuardHome 解压失败"
+        AGH_FAIL=1
+    fi
+fi
 
-        [ ! -f "\$AC/AdGuardHome.yaml" ] && [ -f "/etc/adguardhome/AdGuardHome.yaml" ] && \
-            cp -a /etc/adguardhome/. "\$AC/" 2>/dev/null && log "✅ AGH 配置已迁移"
-        [ -z "\$(ls -A "\$AD" 2>/dev/null)" ] && [ -d "/var/lib/adguardhome" ] && \
-            cp -a /var/lib/adguardhome/. "\$AD/" 2>/dev/null && log "✅ AGH 数据已迁移"
+if [ "$AGH_FAIL" -eq 0 ]; then
+    /etc/init.d/adguardhome stop 2>/dev/null || true
 
-        cat > /etc/init.d/adguardhome << 'AINIT'
+    # 配置迁移（首次）
+    if [ ! -f "$AGH_CONF/AdGuardHome.yaml" ] \
+    && [ -f "/etc/adguardhome/AdGuardHome.yaml" ]; then
+        cp -a /etc/adguardhome/. "$AGH_CONF/" 2>/dev/null
+        log "✅ AGH 配置已迁移至 U 盘（首次）"
+    else
+        log "ℹ️  AGH 配置已存在或无源配置，不覆盖"
+    fi
+
+    # 运行数据迁移（首次）
+    if [ -z "$(ls -A "$AGH_DATA" 2>/dev/null)" ] \
+    && [ -d "/var/lib/adguardhome" ] \
+    && [ -n "$(ls -A /var/lib/adguardhome 2>/dev/null)" ]; then
+        cp -a /var/lib/adguardhome/. "$AGH_DATA/" 2>/dev/null
+        log "✅ AGH 数据已迁移至 U 盘（首次）"
+    fi
+
+    # init.d 脚本
+    cat > /etc/init.d/adguardhome << 'AINITEOF'
 #!/bin/sh /etc/rc.common
 START=98; STOP=10; USE_PROCD=1
 start_service() {
     [ -f /etc/install-usb-done ] || return 0
-    M=$(cat /etc/install-usb-mount 2>/dev/null)
-    [ -n "$M" ] && [ -f "$M/adguardhome-bin/AdGuardHome" ] || return 1
+    MP=$(cat /etc/install-usb-mount 2>/dev/null)
+    [ -n "$MP" ] && [ -f "$MP/adguardhome-bin/AdGuardHome" ] || return 1
     procd_open_instance
-    procd_set_param command "$M/adguardhome-bin/AdGuardHome" \
-        --config "$M/adguardhome-config/AdGuardHome.yaml" \
-        --work-dir "$M/adguardhome-data"
+    procd_set_param command "$MP/adguardhome-bin/AdGuardHome" \
+        --config "$MP/AdGuardHome/config/AdGuardHome.yaml" \
+        --work-dir "$MP/AdGuardHome/data" \
+        --no-check-update
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_set_param respawn 3600 5 3
     procd_close_instance
 }
-stop_service() { pkill AdGuardHome 2>/dev/null; return 0; }
-AINIT
-        chmod +x /etc/init.d/adguardhome
-        /etc/init.d/adguardhome enable  >/dev/null 2>&1
-        /etc/init.d/adguardhome restart >/dev/null 2>&1
-        sleep 3
-        pgrep -x AdGuardHome >/dev/null 2>&1 && __aok=1
-        [ "\$__aok" -eq 1 ] \
-            && log "✅ AdGuardHome \$AGH_VER 已启动" \
-            || log "⚠️ AGH 进程未就绪"
-    } || log "❌ AdGuardHome 解压失败"
+stop_service() { pkill AdGuardHome 2>/dev/null || true; }
+AINITEOF
+    chmod +x /etc/init.d/adguardhome
+    /etc/init.d/adguardhome enable  2>/dev/null || true
+    /etc/init.d/adguardhome restart 2>/dev/null || true
+    sleep 3
+    if pgrep AdGuardHome >/dev/null 2>&1; then
+        log "✅ AdGuardHome 已启动 | 配置: $AGH_CONF | 数据: $AGH_DATA"
+    else
+        log "⚠️  AdGuardHome 启动失败"
+        AGH_FAIL=1
+    fi
+
+    # luci-app-adguardhome（apk 源有）
+    if [ "$AGH_FAIL" -eq 0 ] && [ "${FLASH_FREE:-99999}" -ge 25000 ]; then
+        _tmp=$(mktemp /tmp/apk-out.XXXXXX)
+        apk add --no-cache luci-app-adguardhome \
+            > "$_tmp" 2>&1
+        cat "$_tmp" | logger -t "$LOG_TAG"
+        rm -f "$_tmp"
+        log "✅ luci-app-adguardhome 已安装"
+    fi
 fi
 
-# ── 刷新 LuCI ────────────────────────────────────────────────────
-rm -f /tmp/luci-indexcache* 2>/dev/null
-/etc/init.d/rpcd restart >/dev/null 2>&1
+# ── 刷新 LuCI ───────────────────────────────────────────
+rm -f /tmp/luci-indexcache* 2>/dev/null || true
+/etc/init.d/rpcd restart 2>/dev/null || true
 
-# ── 收尾 ─────────────────────────────────────────────────────────
-if [ "\$__dok" -eq 1 ] || [ "\$__aok" -eq 1 ]; then
-    touch "\$USB_DONE"
-    rm -f "\$STATE_DIR/phase2-failures"
-    _ds=\$([ "\$__dok" -eq 1 ] && echo "OK" || echo "FL")
-    _as=\$([ "\$__aok" -eq 1 ] && echo "OK" || echo "FL")
-    log "🎉 重型应用完成 [Docker:\$_ds AGH:\$_as]"
+# ── 收尾 ────────────────────────────────────────────────
+if [ "$DOCKER_FAIL" -eq 0 ] || [ "$AGH_FAIL" -eq 0 ]; then
+    touch "$USB_DONE"
+    rm -f "$STATE_DIR/phase2-failures"
+    _ds=$([ "$DOCKER_FAIL" -eq 0 ] && echo "OK" || echo "FL")
+    _as=$([ "$AGH_FAIL"    -eq 0 ] && echo "OK" || echo "FL")
+    log "🎉 重型应用部署完成 [Docker:$_ds AGH:$_as]"
     exit 0
+else
+    echo $((__fail + 1)) > "$STATE_DIR/phase2-failures"
+    log "❌ Docker 和 AGH 均失败（重试 $((__fail + 1))/3）"
+    log "💡 手动重跑: rm -f /etc/install-usb-done && $0 --force"
+    exit 1
 fi
-echo \$((\$__fail + 1)) > "\$STATE_DIR/phase2-failures"
-log "❌ 全部失败，等待自愈重试 (\$((\$__fail + 1))/3)"
-log "💡 手动重跑: rm -f /etc/install-usb-done && /usr/lib/install-extras/install-usb.sh --force"
-exit 1
 USBEOF
 chmod +x /usr/lib/install-extras/install-usb.sh
 
@@ -363,8 +495,8 @@ chmod +x /usr/lib/install-extras/install-usb.sh
 # ====================================================================
 cat > /usr/lib/install-extras/run.sh << 'RUNEOF'
 #!/bin/sh
-LOG_TAG="main"
-DONE="/etc/install-extras-done"
+LOG_TAG="install-main"
+DONE_FLAG="/etc/install-extras-done"
 USB_DONE="/etc/install-usb-done"
 LOCK="/tmp/install-main.lock"
 STATE_DIR="/etc/install-state"
@@ -373,119 +505,202 @@ log() { echo "[$(date '+%H:%M:%S')] $1" | logger -t "$LOG_TAG"; }
 _is_mounted() { grep -q "^[^ ]* $1 " /proc/mounts 2>/dev/null; }
 
 mkdir -p "$STATE_DIR"
-[ -f "$DONE" ] && { log "ℹ️ 基础已完成，跳过"; exit 0; }
+[ -f "$DONE_FLAG" ] && { log "ℹ️  基础环境已完成，跳过"; exit 0; }
 
+# ── PID 锁 ───────────────────────────────────────────────
 trap 'rm -f "$LOCK"' EXIT INT TERM
 if [ -f "$LOCK" ]; then
     _pid=$(cat "$LOCK" 2>/dev/null)
-    kill -0 "$_pid" 2>/dev/null && { log "⚠️ 运行中 (pid=$_pid)，跳过"; exit 0; }
-    log "🔧 清理残留锁 (旧pid=$_pid)"; rm -f "$LOCK"
+    kill -0 "$_pid" 2>/dev/null && {
+        log "⚠️  运行中 (pid=$_pid)，跳过"; exit 0
+    }
+    log "🔧 清理残留锁 (旧pid=$_pid)"
+    rm -f "$LOCK"
 fi
 echo $$ > "$LOCK"
 
+# ── 重试计数保护 ─────────────────────────────────────────
 __fail=$(cat "$STATE_DIR/phase1-failures" 2>/dev/null || echo 0)
-[ "${__fail:-0}" -ge 3 ] && { log "❌ 失败过多，暂停自动重试"; exit 1; }
+if [ "${__fail:-0}" -ge 3 ]; then
+    log "❌ 失败次数过多（${__fail}/3），停止自动重试"
+    log "💡 手动修复: rm -f $STATE_DIR/phase1-failures && $0"
+    exit 1
+fi
 
-log "▶ v6.2 基础环境启动"
-sleep 10
+log "▶ v7.0 基础环境启动"
 
+# ── 清理无效软件源 ───────────────────────────────────────
 for _f in /etc/apk/repositories.d/*.list; do
-    [ -f "$_f" ] && sed '/\/video\//d' "$_f" > "${_f}.tmp" && mv "${_f}.tmp" "$_f"
+    [ -f "$_f" ] && sed '/\/video\//d' "$_f" > "${_f}.tmp" \
+        && mv "${_f}.tmp" "$_f"
 done 2>/dev/null
 
-NET_OK=0; _i=1
+# ── 等待网络（最长 3 分钟）──────────────────────────────
+sleep 10
+NET_OK=0
+_i=1
 while [ "$_i" -le 36 ]; do
     ping -c1 -W2 223.5.5.5 >/dev/null 2>&1 && { NET_OK=1; break; }
     ping -c1 -W2 8.8.8.8   >/dev/null 2>&1 && { NET_OK=1; break; }
-    sleep 5; _i=$((_i + 1))
+    sleep 5
+    _i=$((_i + 1))
 done
-[ "$NET_OK" -eq 0 ] && {
-    log "❌ 网络不可达"
-    echo $((__fail + 1)) > "$STATE_DIR/phase1-failures"; exit 1
-}
-log "✅ 网络就绪"
+if [ "$NET_OK" -eq 0 ]; then
+    log "❌ 网络不可达，等待下次 WAN UP 重试"
+    echo $((__fail + 1)) > "$STATE_DIR/phase1-failures"
+    exit 1
+fi
+log "✅ 网络已就绪"
 
+# ── DNS 注入（完成后精确恢复）───────────────────────────
 __dns_old=$(cat /etc/resolv.conf 2>/dev/null)
 [ -z "$__dns_old" ] && __dns_old="nameserver 127.0.0.1"
 printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
 trap 'rm -f "$LOCK"; printf "%s\n" "$__dns_old" > /etc/resolv.conf; /etc/init.d/dnsmasq restart >/dev/null 2>&1; log "✅ DNS 已恢复"' EXIT INT TERM
 log "✅ 临时 DNS 已注入"
 
-FLASH=$(df /overlay 2>/dev/null | awk 'NR==2{print $4}')
-log "📊 Flash 剩余: ${FLASH:-?}KB"
-[ "${FLASH:-0}" -lt 20480 ] && {
-    log "❌ Flash 不足 20MB"
-    echo $((__fail + 1)) > "$STATE_DIR/phase1-failures"; exit 1
-}
-
-__apk_update() {
-    _t=$(mktemp /tmp/apk.XXXXXX)
-    apk update > "$_t" 2>&1; cat "$_t" | logger -t "$LOG_TAG"
-    _n=$(grep -oE 'OK: [0-9]+ distinct' "$_t" 2>/dev/null | grep -oE '[0-9]+' | head -1)
-    rm -f "$_t"; [ "${_n:-0}" -gt 800 ] && return 0
-    log "⚠️ HTTPS 不足，切换 HTTP"
-    for _f in /etc/apk/repositories.d/*.list; do
-        [ -f "$_f" ] && sed 's|https://|http://|g' "$_f" > "${_f}.tmp" && mv "${_f}.tmp" "$_f"
-    done 2>/dev/null
-    _t=$(mktemp /tmp/apk.XXXXXX)
-    apk update > "$_t" 2>&1; cat "$_t" | logger -t "$LOG_TAG"
-    _n=$(grep -oE 'OK: [0-9]+ distinct' "$_t" 2>/dev/null | grep -oE '[0-9]+' | head -1)
-    rm -f "$_t"; [ "${_n:-0}" -gt 800 ]
-}
-__apk_update || {
-    log "❌ apk update 失败"
-    echo $((__fail + 1)) > "$STATE_DIR/phase1-failures"; exit 1
-}
-log "✅ apk update 成功"
-
-__inst_fail=0
-__inst() {
-    _t=$(mktemp /tmp/apk.XXXXXX); log "📦 $*"
-    apk add --no-cache "$@" > "$_t" 2>&1; _r=$?
-    cat "$_t" | logger -t "$LOG_TAG"; rm -f "$_t"
-    [ "$_r" -ne 0 ] && { log "❌ 失败: $*"; __inst_fail=$((__inst_fail + 1)); }
-    return $_r
-}
-
-__inst bash htop lsblk smartmontools fdisk
-[ "${FLASH:-0}" -ge 25000 ] \
-    && __inst samba4-server luci-app-samba4 luci-i18n-samba4-zh-cn \
-    || log "ℹ️ Flash 不足 25MB，跳过 Samba"
-
-/etc/init.d/avahi-daemon stop >/dev/null 2>&1; sleep 1
-/etc/init.d/dbus stop  >/dev/null 2>&1; sleep 1
-/etc/init.d/dbus start >/dev/null 2>&1; sleep 2
-/etc/init.d/avahi-daemon start >/dev/null 2>&1
-log "✅ dbus/avahi 已重载"
-
-rm -f /tmp/luci-indexcache* 2>/dev/null
-/etc/init.d/rpcd restart >/dev/null 2>&1
-
-if [ "$__inst_fail" -ne 0 ]; then
-    log "⚠️ $__inst_fail 组包失败，下次 WAN UP 自动重试"
-    echo $((__fail + 1)) > "$STATE_DIR/phase1-failures"; exit 1
+# ── Flash 空间预检（需 ≥ 20MB）─────────────────────────
+FLASH_FREE=$(df /overlay 2>/dev/null | awk 'NR==2{print $4}')
+FLASH_USED=$(df /overlay 2>/dev/null | awk 'NR==2{print $5}' | tr -d '%')
+log "📊 Flash: 已用 ${FLASH_USED:-?}% | 剩余 ${FLASH_FREE:-?}KB"
+if [ "${FLASH_FREE:-0}" -lt 20480 ]; then
+    log "❌ Flash 剩余不足 20MB，中止防变砖"
+    echo $((__fail + 1)) > "$STATE_DIR/phase1-failures"
+    exit 1
 fi
 
-touch "$DONE"
-rm -f "$STATE_DIR/phase1-failures"
-FLASH_FINAL=$(df /overlay 2>/dev/null | awk 'NR==2{print $5}' | tr -d '%')
-log "🎉 基础环境完成！Flash: ${FLASH_FINAL:-?}%"
+SKIP_LUCI=0
+[ "${FLASH_FREE:-99999}" -lt 25000 ] && SKIP_LUCI=1 \
+    && log "⚠️  Flash <25MB，跳过可选 LuCI"
 
-# 一次性检查 U 盘，已挂载则用 --force 触发（清零失败计数）
-[ ! -f "$USB_DONE" ] && {
-    MP=""
-    for _m in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
-        _is_mounted "$_m" && { MP="$_m"; break; }
+# ── apk update（HTTPS → HTTP 自动降级）─────────────────
+apk_update_ok() {
+    local tmp n
+    tmp=$(mktemp /tmp/apk-upd.XXXXXX)
+    apk update > "$tmp" 2>&1
+    cat "$tmp" | logger -t "$LOG_TAG"
+    n=$(grep -oE 'OK: [0-9]+ distinct' "$tmp" | grep -oE '[0-9]+')
+    rm -f "$tmp"
+    [ "${n:-0}" -gt 800 ] && return 0
+    log "⚠️  HTTPS 包数不足（${n:-0}），切换 HTTP 重试..."
+    for _f in /etc/apk/repositories.d/*.list; do
+        [ -f "$_f" ] && sed 's|https://|http://|g' "$_f" > "${_f}.tmp" \
+            && mv "${_f}.tmp" "$_f"
     done
-    [ -z "$MP" ] && MP=$(grep -E '^/dev/sd[a-z][0-9]* ' /proc/mounts 2>/dev/null \
-                         | head -1 | awk '{print $2}')
-    if [ -n "$MP" ]; then
-        log "✅ U 盘已挂载: $MP，触发重型应用..."
-        /usr/lib/install-extras/install-usb.sh "$MP" --force &
+    tmp=$(mktemp /tmp/apk-upd.XXXXXX)
+    apk update > "$tmp" 2>&1
+    cat "$tmp" | logger -t "$LOG_TAG"
+    n=$(grep -oE 'OK: [0-9]+ distinct' "$tmp" | grep -oE '[0-9]+')
+    rm -f "$tmp"
+    [ "${n:-0}" -gt 800 ] && return 0
+    return 1
+}
+if ! apk_update_ok; then
+    log "❌ apk update 失败，等待下次重试"
+    echo $((__fail + 1)) > "$STATE_DIR/phase1-failures"
+    exit 1
+fi
+log "✅ apk update 成功"
+
+# ── 安装函数（mktemp 正确捕获退出码）───────────────────
+INSTALL_FAIL=0
+install_pkg() {
+    local tmp ret
+    tmp=$(mktemp /tmp/apk-out.XXXXXX)
+    log "📦 安装: $*"
+    apk add --no-cache "$@" > "$tmp" 2>&1
+    ret=$?
+    cat "$tmp" | logger -t "$LOG_TAG"
+    rm -f "$tmp"
+    if [ "$ret" -eq 0 ]; then
+        log "✅ 完成: $*"
     else
-        log "ℹ️ U 盘未挂载，等待 hotplug 哨兵触发"
+        log "❌ 失败: $* (exit $ret)"
+        INSTALL_FAIL=$((INSTALL_FAIL + 1))
     fi
 }
+
+# ── 基础工具（各包独立安装）────────────────────────────
+install_pkg bash
+install_pkg htop
+install_pkg lsblk
+install_pkg smartmontools
+install_pkg fdisk
+
+# ── Samba（Flash ≥ 64MB 时安装）────────────────────────
+FLASH_FREE=$(df /overlay 2>/dev/null | awk 'NR==2{print $4}')
+if [ "${FLASH_FREE:-0}" -ge 65536 ]; then
+    install_pkg samba4-server
+    if [ "$SKIP_LUCI" -eq 0 ]; then
+        install_pkg luci-app-samba4
+        install_pkg luci-i18n-samba4-zh-cn
+    else
+        log "ℹ️  跳过 luci-app-samba4（Flash 紧张）"
+    fi
+else
+    log "ℹ️  Flash 不足 64MB（${FLASH_FREE}KB），跳过 Samba"
+fi
+
+# ── 修复 avahi 崩溃（stop→start 避免残留进程）──────────
+mkdir -p /etc/dbus-1
+/etc/init.d/avahi-daemon stop 2>/dev/null || true
+sleep 1
+/etc/init.d/dbus stop         2>/dev/null || true
+sleep 1
+/etc/init.d/dbus start        2>/dev/null || true
+sleep 2
+/etc/init.d/avahi-daemon start 2>/dev/null || true
+log "✅ dbus/avahi-daemon 已重载"
+
+# ── zram 兜底 ────────────────────────────────────────────
+if ! grep -q zram /proc/swaps 2>/dev/null; then
+    if modprobe zram num_devices=1 2>/dev/null \
+    && [ -e /sys/block/zram0/disksize ]; then
+        echo "134217728" > /sys/block/zram0/disksize
+        mkswap /dev/zram0 >/dev/null 2>&1
+        swapon /dev/zram0 2>/dev/null \
+            && log "✅ zram 128MB 已启用" \
+            || log "⚠️  zram 启用失败"
+    else
+        log "ℹ️  zram 不可用（内核不支持）"
+    fi
+fi
+
+# ── 刷新 LuCI ───────────────────────────────────────────
+rm -f /tmp/luci-indexcache* 2>/dev/null || true
+/etc/init.d/rpcd restart 2>/dev/null || true
+
+# ── Phase 1 收尾 ────────────────────────────────────────
+if [ "$INSTALL_FAIL" -eq 0 ]; then
+    touch "$DONE_FLAG"
+    rm -f "$STATE_DIR/phase1-failures"
+    FLASH_FINAL=$(df /overlay 2>/dev/null | awk 'NR==2{print $5}' | tr -d '%')
+    log "🎉 基础环境部署完成！Flash 使用率: ${FLASH_FINAL:-?}%"
+    [ "${FLASH_FINAL:-0}" -gt 85 ] && log "⚠️  Flash >85%，建议: apk cache clean"
+else
+    echo $((__fail + 1)) > "$STATE_DIR/phase1-failures"
+    log "⚠️  $INSTALL_FAIL 组包失败（重试 $((__fail + 1))/3）"
+    exit 1
+fi
+
+# ── Phase 2：主动检测 U 盘（后台触发）──────────────────
+if [ ! -f "$USB_DONE" ]; then
+    USB_MOUNT=""
+    for _mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
+        _is_mounted "$_mp" && { USB_MOUNT="$_mp"; break; }
+    done
+    [ -z "$USB_MOUNT" ] && \
+        USB_MOUNT=$(grep -E '^/dev/sd[a-z][0-9]* ' /proc/mounts 2>/dev/null \
+                    | head -1 | awk '{print $2}')
+    if [ -n "$USB_MOUNT" ]; then
+        log "✅ 检测到 U 盘: $USB_MOUNT，后台触发重型应用..."
+        /usr/lib/install-extras/install-usb.sh "$USB_MOUNT" --force &
+    else
+        log "ℹ️  未检测到 U 盘，等待 hotplug 哨兵触发"
+    fi
+fi
+
+log "💡 执行 '360v6-status' 查看完整状态"
 RUNEOF
 chmod +x /usr/lib/install-extras/run.sh
 
@@ -495,67 +710,72 @@ chmod +x /usr/lib/install-extras/run.sh
 cat > /etc/hotplug.d/iface/96-install-extras << 'IFACEEOF'
 #!/bin/sh
 [ "$ACTION" = "ifup" ] || exit 0
-case "$INTERFACE" in wan|wan6|pppoe-wan) ;; *) exit 0 ;; esac
+case "$INTERFACE" in
+    wan|wan6|pppoe-wan) ;;
+    *) exit 0 ;;
+esac
 [ -f /etc/install-extras-done ] && exit 0
-logger -t "hotplug" "🌐 WAN 上线，触发基础环境"
+logger -t "hotplug" "🌐 WAN 上线，触发基础环境部署"
 /usr/lib/install-extras/run.sh &
 IFACEEOF
 chmod +x /etc/hotplug.d/iface/96-install-extras
 
 # ====================================================================
-# 模块 D：U 盘 hotplug（v6.2：加 --force 参数）
+# 模块 D：U 盘 hotplug（兜底）
 # ====================================================================
 cat > /etc/hotplug.d/block/96-install-usb << 'BLOCKEOF'
 #!/bin/sh
 _is_mounted() { grep -q "^[^ ]* $1 " /proc/mounts 2>/dev/null; }
+
 [ "$ACTION" = "add" ]           || exit 0
 [ -f /etc/install-usb-done ]    && exit 0
 [ -f /etc/install-extras-done ] || exit 0
 
 logger -t "hotplug" "💾 U 盘插入: DEVNAME=${DEVNAME:-?}"
 
-MP=""; _i=1
+# 等待挂载点就绪（最长 30 秒）
+MP=""
+_i=1
 while [ "$_i" -le 15 ]; do
     for _mp in /mnt/sda1 /mnt/sda /mnt/sdb1 /mnt/sdb /mnt/usb /mnt/mmcblk0p1; do
         _is_mounted "$_mp" && { MP="$_mp"; break 2; }
     done
-    MP=$(grep -E '^/dev/sd[a-z][0-9]* ' /proc/mounts 2>/dev/null | head -1 | awk '{print $2}')
+    [ -z "$MP" ] && \
+        MP=$(grep -E '^/dev/sd[a-z][0-9]* ' /proc/mounts 2>/dev/null \
+             | head -1 | awk '{print $2}')
     [ -n "$MP" ] && break
-    sleep 2; _i=$((_i + 1))
+    sleep 2
+    _i=$((_i + 1))
 done
 
-[ -z "$MP" ] && { logger -t "hotplug" "⚠️ 挂载点未就绪，跳过"; exit 1; }
+if [ -z "$MP" ]; then
+    logger -t "hotplug" "⚠️  挂载点未就绪，跳过"
+    exit 1
+fi
 
+# 避免与 run.sh 主动触发重复
 pgrep -f "install-usb.sh" >/dev/null 2>&1 && {
-    logger -t "hotplug" "⚠️ 已在运行，跳过"; exit 0
+    logger -t "hotplug" "ℹ️  install-usb.sh 已在运行，跳过"
+    exit 0
 }
 
 logger -t "hotplug" "💾 U 盘就绪: $MP，触发重型应用 (--force)"
-# v6.2：hotplug 加 --force，自动清零失败计数，不被 3/3 拦截
 /usr/lib/install-extras/install-usb.sh "$MP" --force &
 BLOCKEOF
 chmod +x /etc/hotplug.d/block/96-install-usb
 
 # ====================================================================
-# 模块 E：自愈定时任务
+# 模块 E：自愈定时任务（每 5 分钟）
 # ====================================================================
-if ! grep -q "self-heal" /etc/crontabs/root 2>/dev/null; then
+if ! grep -q "install-usb.sh" /etc/crontabs/root 2>/dev/null; then
     echo "*/5 * * * * PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/lib/install-extras/install-usb.sh --self-heal 2>&1 | logger -t self-heal" \
         >> /etc/crontabs/root
     /etc/init.d/cron restart 2>/dev/null || true
 fi
 
 # ====================================================================
-# 首次触发
+# 完成
 # ====================================================================
-[ ! -f /etc/install-extras-done ] && /usr/lib/install-extras/run.sh &
-
-logger -t "install-extras" "✅ v6.2 就绪 | Docker:${DOCKER_VER} AGH:${AGH_VER}"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "🚀 v6.2 部署完成"
-echo "   Docker : ${DOCKER_VER}"
-echo "   AGH    : ${AGH_VER}"
-echo "📊 状态 : 360v6-status"
-echo "📋 日志 : logread -f | grep -E 'main|usb|hotplug|self-heal'"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+logger -t "install-extras" "✅ v7.0 哨兵系统已就绪"
+logger -t "install-extras" "💡 执行 '360v6-status' 查看部署状态"
 exit 0
